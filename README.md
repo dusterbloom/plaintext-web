@@ -8,7 +8,8 @@ Your document stays in your browser unless you explicitly open or save a file.
 
 ## Try it
 
-The hosted demo link will be added after the final browser acceptance pass.
+Open the [live demo](https://dusterbloom.github.io/plaintext-web/), or download
+index.html and open it locally.
 
 ## Offline use
 
