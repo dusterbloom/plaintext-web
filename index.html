@@ -324,7 +324,14 @@ select{
     <select id="fontPick"></select>
   </div>
 
-  <label class="toggle"><input type="checkbox" id="soundToggle"> Key sound</label>
+  <div class="group">
+    <div class="label"><label for="soundPick">Key sound</label></div>
+    <select id="soundPick">
+      <option value="off">Off</option>
+      <option value="typewriter">Typewriter</option>
+      <option value="tap">Soft tap</option>
+    </select>
+  </div>
   <label class="toggle"><input type="checkbox" id="countToggle"> Show word count</label>
   <p class="note" id="storageNote" hidden></p>
 </div></dialog>
@@ -539,6 +546,12 @@ function isValidFinishedSession(finished, goal, minutes) {
     ? finished.count >= goal
     : finished.count < goal;
 }
+
+function resolveSoundPreference(value) {
+  if (value === "soft") return "typewriter";
+  if (value === "typewriter" || value === "tap") return value;
+  return "off";
+}
 /* @testable:end */
 
 /* ------------------------------------------------------------------ *
@@ -565,10 +578,11 @@ function rememberedTheme(key, fallback, wantDark) {
   return THEMES[id] && THEMES[id].dark === wantDark ? id : fallback;
 }
 
+const storedSound = store.get(K.sound);
 const settings = {
   theme: THEMES[store.get(K.theme)] ? store.get(K.theme) : "paper",
   font:  FONTS[store.get(K.font)] ? store.get(K.font) : "literata",
-  sound: store.get(K.sound) === "soft",
+  sound: resolveSoundPreference(storedSound),
   count: store.get(K.count) === "true",
   light: rememberedTheme(K.light, "paper", false),
   dark:  rememberedTheme(K.dark, "ink", true),
@@ -576,6 +590,7 @@ const settings = {
   // a theme keeps it until they opt in.
   match: store.get(K.match) === null ? store.get(K.theme) === null : store.get(K.match) === "true"
 };
+if (storedSound === "soft") store.set(K.sound, "typewriter");
 
 const darkMedia = window.matchMedia("(prefers-color-scheme: dark)");
 
@@ -627,8 +642,9 @@ const SHIFT = MAC ? "\u21e7" : "Shift ";
  * TypewriterSoundPlayer.swift: shaped noise cushion plus a 235 Hz body.
  * ------------------------------------------------------------------ */
 const sound = (() => {
-  const RATE = 44100, DURATION = 0.058;
-  let ctx = null, buffer = null, last = 0;
+  const RATE = 44100;
+  const buffers = Object.create(null);
+  let ctx = null, last = 0;
 
   const noise = (i) => {
     let v = BigInt.asUintN(64, BigInt(i) + 0x50F7n);
@@ -638,9 +654,9 @@ const sound = (() => {
     return Number(v & 0xFFFFn) / 32767.5 - 1;
   };
 
-  function build() {
-    const count = Math.floor(RATE * DURATION);
-    buffer = ctx.createBuffer(1, count, RATE);
+  function buildTypewriter() {
+    const count = Math.floor(RATE * 0.058);
+    const buffer = ctx.createBuffer(1, count, RATE);
     const data = buffer.getChannelData(0);
     for (let i = 0; i < count; i++) {
       const t = i / RATE;
@@ -649,22 +665,44 @@ const sound = (() => {
       const warmth = Math.sin(2 * Math.PI * 235 * t) * Math.exp(-t / 0.024) * 0.10;
       data[i] = Math.max(-1, Math.min(1, (cushion + warmth) * 0.60));
     }
+    return buffer;
   }
 
-  return function play() {
-    if (!settings.sound) return;
+  function buildTap() {
+    const duration = 0.040;
+    const buffer = ctx.createBuffer(1, Math.floor(RATE * duration), RATE);
+    const data = buffer.getChannelData(0);
+    let smooth = 0;
+    for (let i = 0; i < data.length; i += 1) {
+      const t = i / RATE;
+      smooth += (noise(i) - smooth) * 0.18;
+      const attack = Math.min(1, t / 0.002);
+      const decay = Math.exp(-t / 0.010);
+      data[i] = smooth * attack * decay * 0.28;
+    }
+    return buffer;
+  }
+
+  return function play(mode = settings.sound, preview = false) {
+    if (mode === "off") return;
     const now = performance.now();
-    if (now - last < 25) return;                       // 0.025 s throttle
+    if (!preview && now - last < 25) return;           // 0.025 s throttle
     last = now;
     try {
-      if (!ctx) { ctx = new (window.AudioContext || window.webkitAudioContext)(); build(); }
-      if (ctx.state === "suspended") ctx.resume();
-      const src = ctx.createBufferSource();
-      const gain = ctx.createGain();
-      gain.gain.value = 0.16;                          // matches NSSound volume
-      src.buffer = buffer;
-      src.connect(gain).connect(ctx.destination);
-      src.start();
+      if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const start = () => {
+        if (!buffers[mode]) {
+          buffers[mode] = mode === "tap" ? buildTap() : buildTypewriter();
+        }
+        const src = ctx.createBufferSource();
+        const gain = ctx.createGain();
+        gain.gain.value = mode === "tap" ? 0.12 : 0.16;
+        src.buffer = buffers[mode];
+        src.connect(gain).connect(ctx.destination);
+        src.start();
+      };
+      if (ctx.state === "suspended") void ctx.resume().then(start).catch(() => {});
+      else start();
     } catch (_) { /* audio unavailable; typing continues */ }
   };
 })();
@@ -1137,7 +1175,7 @@ function buildSettings() {
   pick.value = settings.font;
 
   $("matchToggle").checked = settings.match;
-  $("soundToggle").checked = settings.sound;
+  $("soundPick").value = settings.sound;
   $("countToggle").checked = settings.count;
 
   if (!store.live()) {
@@ -1179,9 +1217,10 @@ $("fontPick").addEventListener("change", (e) => {
   applyTheme();
   if (session.active) buildBars();
 });
-$("soundToggle").addEventListener("change", (e) => {
-  settings.sound = e.target.checked;
-  store.set(K.sound, settings.sound ? "soft" : "off");
+$("soundPick").addEventListener("change", (event) => {
+  settings.sound = resolveSoundPreference(event.target.value);
+  store.set(K.sound, settings.sound);
+  if (settings.sound !== "off") sound(settings.sound, true);
 });
 $("countToggle").addEventListener("change", (e) => {
   settings.count = e.target.checked;

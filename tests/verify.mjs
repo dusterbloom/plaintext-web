@@ -839,6 +839,49 @@ test("selection, announcements, and motion wiring stay scoped", () => {
   );
 });
 
+test("key sound preferences preserve legacy users and reject unknown values", () => {
+  const { resolveSoundPreference } = extractTestableLogic(readApp(), [
+    "resolveSoundPreference",
+  ]);
+
+  assert.equal(resolveSoundPreference(null), "off");
+  assert.equal(resolveSoundPreference("off"), "off");
+  assert.equal(resolveSoundPreference("soft"), "typewriter");
+  assert.equal(resolveSoundPreference("typewriter"), "typewriter");
+  assert.equal(resolveSoundPreference("tap"), "tap");
+  assert.equal(resolveSoundPreference("loud"), "off");
+});
+
+test("settings expose one accessible three-state key sound selector", () => {
+  const html = readApp();
+  assert.match(html, /<label for="soundPick">Key sound<\/label>/);
+  assert.match(
+    html,
+    /<select id="soundPick">[\s\S]*value="off"[\s\S]*value="typewriter"[\s\S]*value="tap"[\s\S]*<\/select>/,
+  );
+  assert.doesNotMatch(html, /id="soundToggle"/);
+});
+
+test("key sound selection stores canonical values and previews distinct buffers", () => {
+  const html = readApp();
+  const script = extractInlineScript(html);
+  assert.match(script, /function buildTypewriter\(/);
+  assert.match(script, /function buildTap\(/);
+  assert.match(script, /buffers\[mode\]/);
+  assert.match(
+    script,
+    /\$\("soundPick"\)\.addEventListener\("change",[\s\S]{0,260}store\.set\(K\.sound, settings\.sound\)[\s\S]{0,160}sound\(settings\.sound, true\)/,
+  );
+  assert.match(
+    script,
+    /if \(storedSound === "soft"\) store\.set\(K\.sound, "typewriter"\)/,
+  );
+  assert.match(
+    script,
+    /ctx\.resume\(\)\.then\(start\)\.catch\(\(\) => \{\}\)/,
+  );
+});
+
 export {
   appPath,
   extractInlineScript,
