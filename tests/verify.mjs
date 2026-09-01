@@ -854,20 +854,162 @@ test("key sound preferences preserve legacy users and reject unknown values", ()
 
 test("settings expose one accessible three-state key sound selector", () => {
   const html = readApp();
-  assert.match(html, /<label for="soundPick">Key sound<\/label>/);
-  assert.match(
-    html,
-    /<select id="soundPick">[\s\S]*value="off"[\s\S]*value="typewriter"[\s\S]*value="tap"[\s\S]*<\/select>/,
+  assert.equal((html.match(/<label for="soundPick">Key sound<\/label>/g) || []).length, 1);
+  const selects = [...html.matchAll(/<select id="soundPick">([\s\S]*?)<\/select>/g)];
+  assert.equal(selects.length, 1);
+  assert.equal((selects[0][1].match(/<option\b/g) || []).length, 3);
+  assert.deepEqual(
+    [...selects[0][1].matchAll(/<option value="([^"]+)">([^<]+)<\/option>/g)]
+      .map((match) => [match[1], match[2]]),
+    [["off", "Off"], ["typewriter", "Typewriter"], ["tap", "Soft tap"]],
   );
   assert.doesNotMatch(html, /id="soundToggle"/);
 });
 
-test("key sound selection stores canonical values and previews distinct buffers", () => {
+function soundHarness({ state = "running", times = [100], throwOnBuffer = false } = {}) {
+  let resolveResume;
+  let rejectResume;
+  let timeIndex = 0;
+  const starts = [];
+  const buffers = [];
+  const resume = new Promise((resolve, reject) => {
+    resolveResume = resolve;
+    rejectResume = reject;
+  });
+  const context = {
+    state,
+    destination: {},
+    createBuffer(channels, length, rate) {
+      if (throwOnBuffer) throw new Error("audio buffer unavailable");
+      const buffer = {
+        channels,
+        length,
+        rate,
+        data: new Float32Array(length),
+        getChannelData() { return this.data; },
+      };
+      buffers.push(buffer);
+      return buffer;
+    },
+    createBufferSource() {
+      return {
+        buffer: null,
+        connect(node) { this.gainNode = node; return node; },
+        start() {
+          starts.push({ buffer: this.buffer, gain: this.gainNode.gain.value });
+        },
+      };
+    },
+    createGain() {
+      return { gain: { value: 0 }, connect() { return context.destination; } };
+    },
+    resume() { return resume; },
+  };
+  return {
+    buffers,
+    context,
+    createContext: () => context,
+    now: () => times[Math.min(timeIndex++, times.length - 1)],
+    rejectResume,
+    resolveResume,
+    starts,
+  };
+}
+
+test("key sound engine dispatches distinct typewriter and tap buffers", () => {
+  const { createSoundPlayer } = extractTestableLogic(readApp(), [
+    "createSoundPlayer",
+  ]);
+  const harness = soundHarness();
+  const play = createSoundPlayer(harness.now, harness.createContext);
+
+  play("typewriter", true);
+  play("tap", true);
+
+  assert.equal(harness.starts.length, 2);
+  assert.notEqual(harness.starts[0].buffer, harness.starts[1].buffer);
+  assert.equal(harness.starts[0].buffer.length, Math.floor(44100 * 0.058));
+  assert.equal(harness.starts[1].buffer.length, Math.floor(44100 * 0.040));
+  assert.deepEqual(harness.starts.map(({ gain }) => gain), [0.16, 0.12]);
+});
+
+test("key sound engine resumes only the latest pending choice", async () => {
+  const { createSoundPlayer } = extractTestableLogic(readApp(), [
+    "createSoundPlayer",
+  ]);
+  const harness = soundHarness({ state: "suspended" });
+  const play = createSoundPlayer(harness.now, harness.createContext);
+
+  play("typewriter", true);
+  play("tap", true);
+  harness.resolveResume();
+  await new Promise(setImmediate);
+
+  assert.equal(harness.starts.length, 1);
+  assert.equal(harness.starts[0].buffer.length, Math.floor(44100 * 0.040));
+  assert.equal(harness.starts[0].gain, 0.12);
+
+  const keys = soundHarness({
+    state: "suspended",
+    times: [100, 130, 160],
+  });
+  const playKey = createSoundPlayer(keys.now, keys.createContext);
+  playKey("typewriter");
+  playKey("typewriter");
+  playKey("typewriter");
+  keys.resolveResume();
+  await new Promise(setImmediate);
+  assert.equal(keys.starts.length, 1);
+});
+
+test("turning key sound off cancels pending playback", async () => {
+  const { createSoundPlayer } = extractTestableLogic(readApp(), [
+    "createSoundPlayer",
+  ]);
+  const harness = soundHarness({ state: "suspended" });
+  const play = createSoundPlayer(harness.now, harness.createContext);
+
+  play("typewriter", true);
+  play("off", true);
+  harness.resolveResume();
+  await new Promise(setImmediate);
+
+  assert.equal(harness.starts.length, 0);
+});
+
+test("key sound typing stays throttled and audio failures stay optional", async () => {
+  const { createSoundPlayer } = extractTestableLogic(readApp(), [
+    "createSoundPlayer",
+  ]);
+  const harness = soundHarness({ times: [100, 110, 130] });
+  const play = createSoundPlayer(harness.now, harness.createContext);
+
+  play("typewriter");
+  play("typewriter");
+  play("typewriter");
+  assert.equal(harness.starts.length, 2);
+
+  const rejected = soundHarness({ state: "suspended" });
+  createSoundPlayer(rejected.now, rejected.createContext)("tap", true);
+  rejected.rejectResume(new Error("audio resume blocked"));
+  await new Promise(setImmediate);
+  assert.equal(rejected.starts.length, 0);
+
+  const throwing = soundHarness({ throwOnBuffer: true });
+  assert.doesNotThrow(() => {
+    createSoundPlayer(throwing.now, throwing.createContext)("tap", true);
+  });
+  assert.doesNotThrow(() => {
+    createSoundPlayer(() => 100, () => { throw new Error("no audio"); })(
+      "tap",
+      true,
+    );
+  });
+});
+
+test("key sound selection stores canonical values and previews choices", () => {
   const html = readApp();
   const script = extractInlineScript(html);
-  assert.match(script, /function buildTypewriter\(/);
-  assert.match(script, /function buildTap\(/);
-  assert.match(script, /buffers\[mode\]/);
   assert.match(
     script,
     /\$\("soundPick"\)\.addEventListener\("change",[\s\S]{0,260}store\.set\(K\.sound, settings\.sound\)[\s\S]{0,160}sound\(settings\.sound, true\)/,
@@ -875,10 +1017,6 @@ test("key sound selection stores canonical values and previews distinct buffers"
   assert.match(
     script,
     /if \(storedSound === "soft"\) store\.set\(K\.sound, "typewriter"\)/,
-  );
-  assert.match(
-    script,
-    /ctx\.resume\(\)\.then\(start\)\.catch\(\(\) => \{\}\)/,
   );
 });
 

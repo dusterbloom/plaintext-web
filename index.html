@@ -552,6 +552,74 @@ function resolveSoundPreference(value) {
   if (value === "typewriter" || value === "tap") return value;
   return "off";
 }
+
+function createSoundPlayer(now, createContext, getMode = () => "off") {
+  const RATE = 44100;
+  const buffers = Object.create(null);
+  let ctx = null, last = 0, request = 0;
+
+  const noise = (i) => {
+    let v = BigInt.asUintN(64, BigInt(i) + 0x50F7n);
+    v = BigInt.asUintN(64, (v ^ (v >> 30n)) * 0xBF58476D1CE4E5B9n);
+    v = BigInt.asUintN(64, (v ^ (v >> 27n)) * 0x94D049BB133111EBn);
+    v ^= v >> 31n;
+    return Number(v & 0xFFFFn) / 32767.5 - 1;
+  };
+
+  function buildTypewriter() {
+    const count = Math.floor(RATE * 0.058);
+    const buffer = ctx.createBuffer(1, count, RATE);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < count; i++) {
+      const t = i / RATE;
+      const low = (noise(i) + noise(i - 1) + noise(i - 2) + noise(i - 3) + noise(i - 4)) / 5;
+      const cushion = low * Math.exp(-t / 0.018) * 0.20;
+      const warmth = Math.sin(2 * Math.PI * 235 * t) * Math.exp(-t / 0.024) * 0.10;
+      data[i] = Math.max(-1, Math.min(1, (cushion + warmth) * 0.60));
+    }
+    return buffer;
+  }
+
+  function buildTap() {
+    const duration = 0.040;
+    const buffer = ctx.createBuffer(1, Math.floor(RATE * duration), RATE);
+    const data = buffer.getChannelData(0);
+    let smooth = 0;
+    for (let i = 0; i < data.length; i += 1) {
+      const t = i / RATE;
+      smooth += (noise(i) - smooth) * 0.18;
+      const attack = Math.min(1, t / 0.002);
+      const decay = Math.exp(-t / 0.010);
+      data[i] = smooth * attack * decay * 0.28;
+    }
+    return buffer;
+  }
+
+  return function play(mode = getMode(), preview = false) {
+    const current = ++request;
+    if (mode === "off") return;
+    const time = now();
+    if (!preview && time - last < 25) return;
+    last = time;
+    try {
+      if (!ctx) ctx = createContext();
+      const start = () => {
+        if (current !== request) return;
+        if (!buffers[mode]) {
+          buffers[mode] = mode === "tap" ? buildTap() : buildTypewriter();
+        }
+        const src = ctx.createBufferSource();
+        const gain = ctx.createGain();
+        gain.gain.value = mode === "tap" ? 0.12 : 0.16;
+        src.buffer = buffers[mode];
+        src.connect(gain).connect(ctx.destination);
+        src.start();
+      };
+      if (ctx.state === "suspended") void ctx.resume().then(start).catch(() => {});
+      else start();
+    } catch (_) { /* audio unavailable; typing continues */ }
+  };
+}
 /* @testable:end */
 
 /* ------------------------------------------------------------------ *
@@ -641,71 +709,11 @@ const SHIFT = MAC ? "\u21e7" : "Shift ";
  * Key sound. The waveform is the exact synthesis from
  * TypewriterSoundPlayer.swift: shaped noise cushion plus a 235 Hz body.
  * ------------------------------------------------------------------ */
-const sound = (() => {
-  const RATE = 44100;
-  const buffers = Object.create(null);
-  let ctx = null, last = 0;
-
-  const noise = (i) => {
-    let v = BigInt.asUintN(64, BigInt(i) + 0x50F7n);
-    v = BigInt.asUintN(64, (v ^ (v >> 30n)) * 0xBF58476D1CE4E5B9n);
-    v = BigInt.asUintN(64, (v ^ (v >> 27n)) * 0x94D049BB133111EBn);
-    v ^= v >> 31n;
-    return Number(v & 0xFFFFn) / 32767.5 - 1;
-  };
-
-  function buildTypewriter() {
-    const count = Math.floor(RATE * 0.058);
-    const buffer = ctx.createBuffer(1, count, RATE);
-    const data = buffer.getChannelData(0);
-    for (let i = 0; i < count; i++) {
-      const t = i / RATE;
-      const low = (noise(i) + noise(i - 1) + noise(i - 2) + noise(i - 3) + noise(i - 4)) / 5;
-      const cushion = low * Math.exp(-t / 0.018) * 0.20;
-      const warmth = Math.sin(2 * Math.PI * 235 * t) * Math.exp(-t / 0.024) * 0.10;
-      data[i] = Math.max(-1, Math.min(1, (cushion + warmth) * 0.60));
-    }
-    return buffer;
-  }
-
-  function buildTap() {
-    const duration = 0.040;
-    const buffer = ctx.createBuffer(1, Math.floor(RATE * duration), RATE);
-    const data = buffer.getChannelData(0);
-    let smooth = 0;
-    for (let i = 0; i < data.length; i += 1) {
-      const t = i / RATE;
-      smooth += (noise(i) - smooth) * 0.18;
-      const attack = Math.min(1, t / 0.002);
-      const decay = Math.exp(-t / 0.010);
-      data[i] = smooth * attack * decay * 0.28;
-    }
-    return buffer;
-  }
-
-  return function play(mode = settings.sound, preview = false) {
-    if (mode === "off") return;
-    const now = performance.now();
-    if (!preview && now - last < 25) return;           // 0.025 s throttle
-    last = now;
-    try {
-      if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
-      const start = () => {
-        if (!buffers[mode]) {
-          buffers[mode] = mode === "tap" ? buildTap() : buildTypewriter();
-        }
-        const src = ctx.createBufferSource();
-        const gain = ctx.createGain();
-        gain.gain.value = mode === "tap" ? 0.12 : 0.16;
-        src.buffer = buffers[mode];
-        src.connect(gain).connect(ctx.destination);
-        src.start();
-      };
-      if (ctx.state === "suspended") void ctx.resume().then(start).catch(() => {});
-      else start();
-    } catch (_) { /* audio unavailable; typing continues */ }
-  };
-})();
+const sound = createSoundPlayer(
+  () => performance.now(),
+  () => new (window.AudioContext || window.webkitAudioContext)(),
+  () => settings.sound,
+);
 
 /* ------------------------------------------------------------------ *
  * Document state
