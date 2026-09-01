@@ -854,8 +854,17 @@ test("key sound preferences preserve legacy users and reject unknown values", ()
 
 test("settings expose one accessible three-state key sound selector", () => {
   const html = readApp();
-  assert.equal((html.match(/<label for="soundPick">Key sound<\/label>/g) || []).length, 1);
-  const selects = [...html.matchAll(/<select id="soundPick">([\s\S]*?)<\/select>/g)];
+  assert.equal((html.match(/\bfor\s*=\s*["']soundPick["']/g) || []).length, 1);
+  assert.equal((html.match(/\bid\s*=\s*["']soundPick["']/g) || []).length, 1);
+  assert.match(
+    html,
+    /<label\b(?=[^>]*\bfor\s*=\s*["']soundPick["'])[^>]*>Key sound<\/label>/,
+  );
+  const selects = [
+    ...html.matchAll(
+      /<select\b(?=[^>]*\bid\s*=\s*["']soundPick["'])[^>]*>([\s\S]*?)<\/select>/g,
+    ),
+  ];
   assert.equal(selects.length, 1);
   assert.equal((selects[0][1].match(/<option\b/g) || []).length, 3);
   assert.deepEqual(
@@ -975,6 +984,19 @@ test("turning key sound off cancels pending playback", async () => {
   await new Promise(setImmediate);
 
   assert.equal(harness.starts.length, 0);
+
+  let currentMode = "typewriter";
+  const implicit = soundHarness({ state: "suspended" });
+  const playCurrent = createSoundPlayer(
+    implicit.now,
+    implicit.createContext,
+    () => currentMode,
+  );
+  playCurrent();
+  currentMode = "off";
+  implicit.resolveResume();
+  await new Promise(setImmediate);
+  assert.equal(implicit.starts.length, 0);
 });
 
 test("key sound typing stays throttled and audio failures stay optional", async () => {
@@ -995,6 +1017,18 @@ test("key sound typing stays throttled and audio failures stay optional", async 
   await new Promise(setImmediate);
   assert.equal(rejected.starts.length, 0);
 
+  const asynchronousThrow = soundHarness({
+    state: "suspended",
+    throwOnBuffer: true,
+  });
+  createSoundPlayer(asynchronousThrow.now, asynchronousThrow.createContext)(
+    "tap",
+    true,
+  );
+  asynchronousThrow.resolveResume();
+  await new Promise(setImmediate);
+  assert.equal(asynchronousThrow.starts.length, 0);
+
   const throwing = soundHarness({ throwOnBuffer: true });
   assert.doesNotThrow(() => {
     createSoundPlayer(throwing.now, throwing.createContext)("tap", true);
@@ -1012,7 +1046,7 @@ test("key sound selection stores canonical values and previews choices", () => {
   const script = extractInlineScript(html);
   assert.match(
     script,
-    /\$\("soundPick"\)\.addEventListener\("change",[\s\S]{0,260}store\.set\(K\.sound, settings\.sound\)[\s\S]{0,160}sound\(settings\.sound, true\)/,
+    /\$\("soundPick"\)\.addEventListener\("change",[\s\S]{0,260}store\.set\(K\.sound, settings\.sound\);\s*sound\(settings\.sound, true\)/,
   );
   assert.match(
     script,

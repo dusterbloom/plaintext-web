@@ -553,7 +553,7 @@ function resolveSoundPreference(value) {
   return "off";
 }
 
-function createSoundPlayer(now, createContext, getMode = () => "off") {
+function createSoundPlayer(now, createContext, getMode = null) {
   const RATE = 44100;
   const buffers = Object.create(null);
   let ctx = null, last = 0, request = 0;
@@ -595,7 +595,7 @@ function createSoundPlayer(now, createContext, getMode = () => "off") {
     return buffer;
   }
 
-  return function play(mode = getMode(), preview = false) {
+  return function play(mode = getMode ? getMode() : "off", preview = false) {
     const current = ++request;
     if (mode === "off") return;
     const time = now();
@@ -604,7 +604,7 @@ function createSoundPlayer(now, createContext, getMode = () => "off") {
     try {
       if (!ctx) ctx = createContext();
       const start = () => {
-        if (current !== request) return;
+        if (current !== request || (getMode && getMode() !== mode)) return;
         if (!buffers[mode]) {
           buffers[mode] = mode === "tap" ? buildTap() : buildTypewriter();
         }
@@ -1228,7 +1228,7 @@ $("fontPick").addEventListener("change", (e) => {
 $("soundPick").addEventListener("change", (event) => {
   settings.sound = resolveSoundPreference(event.target.value);
   store.set(K.sound, settings.sound);
-  if (settings.sound !== "off") sound(settings.sound, true);
+  sound(settings.sound, true);
 });
 $("countToggle").addEventListener("change", (e) => {
   settings.count = e.target.checked;
