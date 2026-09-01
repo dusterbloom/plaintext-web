@@ -1329,8 +1329,9 @@ $("paletteQuery").addEventListener("keydown", (e) => {
   else if (e.key === "Enter") {
     e.preventDefault();
     const command = paletteMatches[paletteIndex];
+    if (!command) return;
     $("palette").close();
-    if (command) command.run();
+    command.run();
   }
 });
 

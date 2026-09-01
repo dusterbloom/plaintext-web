@@ -803,6 +803,14 @@ test("keyboard handling preserves browser and focus conventions", () => {
   assert.match(script, /closest\(\s*["']input, select, textarea, button/);
 });
 
+test("palette Enter guards an empty result before closing", () => {
+  const script = extractInlineScript(readApp());
+  assert.match(
+    script,
+    /else if \(e\.key === ["']Enter["']\) \{[\s\S]{0,200}const command = paletteMatches\[paletteIndex\];\s*if \(!command\) return;\s*\$\(["']palette["']\)\.close\(\);\s*command\.run\(\);/,
+  );
+});
+
 test("selection, announcements, and motion wiring stay scoped", () => {
   const html = readApp();
   const script = extractInlineScript(html);
