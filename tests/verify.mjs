@@ -177,6 +177,11 @@ function normalizeNotice(source) {
 
 test("release is one parseable offline HTML file", () => {
   const html = readApp();
+  assert.doesNotMatch(html, /<link rel="icon" href="data:,">/);
+  assert.match(
+    html,
+    /<link rel="icon" type="image\/svg\+xml" href="data:image\/svg\+xml,/,
+  );
   const runtime = runtimeSource(html);
   const script = extractInlineScript(html);
   assert.equal((html.match(/@font-face/g) || []).length, 4);
@@ -783,7 +788,6 @@ test("dialogs, palette, title, and live output have accessible semantics", () =>
     /role="option"|setAttribute\(["']role["'],\s*["']option["']\)/,
   );
   assert.match(html, /id="sessionStatus"[^>]*role="status"/);
-  assert.match(html, /<link rel="icon" href="data:,"/);
 });
 
 test("keyboard handling preserves browser and focus conventions", () => {
