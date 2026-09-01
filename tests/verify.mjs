@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -35,6 +35,23 @@ function extractTestableLogic(html, names) {
   )();
 }
 
+const legalFiles = [
+  "LICENSE",
+  "THIRD_PARTY_NOTICES.md",
+  "ThirdPartyLicenses/AtkinsonHyperlegible-OFL.txt",
+  "ThirdPartyLicenses/Literata-OFL.txt",
+  "ThirdPartyLicenses/Newsreader-OFL.txt",
+  "ThirdPartyLicenses/WorkSans-OFL.txt",
+];
+
+function legalBlock(html) {
+  const match = html.match(
+    /<template id="legalNotices">([\s\S]*?)<\/template>/,
+  );
+  assert.ok(match, "standalone legal-notices block missing");
+  return match[1];
+}
+
 test("release is one parseable offline HTML file", () => {
   const html = readApp();
   const runtime = runtimeSource(html);
@@ -57,6 +74,26 @@ test("release is one parseable offline HTML file", () => {
     assert.match(html, new RegExp('id="' + id + '"'), id + " is missing");
   }
   assert.doesNotThrow(() => new Function(script));
+});
+
+test("repository and standalone app retain required legal notices", () => {
+  const html = readApp();
+  const embedded = legalBlock(html);
+
+  for (const relative of legalFiles) {
+    const path = resolve(root, relative);
+    assert.ok(existsSync(path), relative + " is missing");
+    const notice = readFileSync(path, "utf8").trim();
+    assert.ok(notice.length > 100, relative + " is unexpectedly short");
+    assert.ok(
+      embedded.includes(notice),
+      relative + " is not embedded verbatim in index.html",
+    );
+  }
+
+  assert.match(html, /JP Aumasson/);
+  assert.match(html, /github\.com\/veorq\/Plaintext/);
+  assert.match(html, /unofficial web adaptation/i);
 });
 
 export {
