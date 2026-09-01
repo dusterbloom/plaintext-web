@@ -304,7 +304,7 @@ select{
   <div class="group">
     <div class="label"><label for="goalAmount">Goal</label></div>
     <div class="field">
-      <input class="num" id="goalAmount" type="number" min="1" step="50" value="1000">
+      <input class="num" id="goalAmount" type="number" min="1" max="1000000" step="1" value="1000">
       <select id="goalUnit" style="width:auto">
         <option value="words">words</option>
         <option value="characters">characters</option>
@@ -315,10 +315,12 @@ select{
   <div class="group">
     <div class="label"><label for="goalMinutes">Time</label></div>
     <div class="field">
-      <input class="num" id="goalMinutes" type="number" min="1" step="5" value="30">
+      <input class="num" id="goalMinutes" type="number" min="1" max="1440" step="1" value="30">
       <span class="note">minutes</span>
     </div>
   </div>
+
+  <p id="sessionError" class="note error" role="alert" hidden></p>
 
   <div class="actions">
     <button class="btn" id="sessionEnd" hidden>End session</button>
@@ -445,6 +447,14 @@ function initiateDownload(link, revoke, schedule, documentState, text) {
 
 function isAbort(error) {
   return error && error.name === "AbortError";
+}
+
+function parseBoundedInteger(value, maximum) {
+  if (typeof value !== "string" || value.trim() === "") return null;
+  const number = Number(value);
+  if (!Number.isFinite(number) || !Number.isInteger(number)) return null;
+  if (number < 1 || number > maximum) return null;
+  return number;
 }
 /* @testable:end */
 
@@ -1304,7 +1314,7 @@ document.addEventListener("click", (e) => {
  * ------------------------------------------------------------------ */
 const session = {
   active: false, finished: null, goal: 1000, unit: "words", minutes: 30,
-  baseline: 0, startedAt: 0, endsAt: 0, bars: [], cum: [], spent: 0, avg: 9, timer: 0, frame: 0
+  baseline: 0, windowBaseline: 0, startedAt: 0, endsAt: 0, bars: [], cum: [], spent: 0, avg: 9, timer: 0, frame: 0
 };
 
 const CAP = 1200;                      // bars are only ever drawn a few screens deep
@@ -1335,18 +1345,31 @@ function measureAverage() {
 
 function buildBars() {
   const fill = $("ghostFill");
-  session.bars = []; session.cum = []; session.spent = 0;
-  if (!session.active) { fill.textContent = ""; $("ghost").hidden = true; return; }
+  session.windowBaseline = sessionProgress();
+  session.bars = [];
+  session.cum = [];
+  session.spent = 0;
+  if (!session.active) {
+    fill.textContent = "";
+    $("ghost").hidden = true;
+    return;
+  }
 
   measureAverage();
-  const next = seeded(0x51FF ^ session.goal);
-  let html = "", units = 0;
-  while (session.bars.length < CAP && units < session.goal) {
+  const remaining = Math.max(0, session.goal - session.windowBaseline);
+  const visibleUnits = Math.min(CAP, remaining);
+  const next = seeded(0x51ff ^ session.goal ^ session.windowBaseline);
+  let html = "";
+  let units = 0;
+  while (session.bars.length < CAP && units < visibleUnits) {
     const len = LENGTHS[Math.floor(next() * LENGTHS.length)];
     units += session.unit === "words" ? 1 : len + 1;
     session.cum.push(units);
     session.bars.push(true);
-    html += '<span class="w"><i style="width:' + Math.round(len * session.avg) + 'px"></i> </span>';
+    html +=
+      '<span class="w"><i style="width:' +
+      Math.round(len * session.avg) +
+      'px"></i> </span>';
   }
   fill.innerHTML = html;
   session.bars = Array.prototype.slice.call(fill.children);
@@ -1356,12 +1379,29 @@ function buildBars() {
 
 /* Only the bars at the boundary change, so typing stays cheap. */
 function paintBars() {
-  const done = sessionProgress();
+  const progress = sessionProgress();
+  const relative = Math.max(0, progress - session.windowBaseline);
+  if (
+    progress < session.windowBaseline ||
+    (relative >= CAP && progress < session.goal)
+  ) {
+    buildBars();
+    return;
+  }
   let target = session.spent;
-  while (target < session.bars.length && session.cum[target] <= done) target++;
-  while (target > 0 && session.cum[target - 1] > done) target--;
-  while (session.spent < target) { session.bars[session.spent].style.display = "none"; session.spent++; }
-  while (session.spent > target) { session.spent--; session.bars[session.spent].style.display = ""; }
+  while (
+    target < session.bars.length &&
+    session.cum[target] <= relative
+  ) target += 1;
+  while (target > 0 && session.cum[target - 1] > relative) target -= 1;
+  while (session.spent < target) {
+    session.bars[session.spent].style.display = "none";
+    session.spent += 1;
+  }
+  while (session.spent > target) {
+    session.spent -= 1;
+    session.bars[session.spent].style.display = "";
+  }
 }
 
 function updateSession() {
@@ -1480,8 +1520,42 @@ function endSession() {
 function restoreSession() {
   let saved = null;
   try { saved = JSON.parse(store.get(K.session) || "null"); } catch (_) {}
-  if (!saved || !saved.goal) return;
-  startSession(saved.goal, saved.unit, saved.minutes, saved);
+
+  const goal = saved
+    ? parseBoundedInteger(String(saved.goal), 1_000_000)
+    : null;
+  const minutes = saved
+    ? parseBoundedInteger(String(saved.minutes), 1_440)
+    : null;
+  const unitIsValid =
+    saved && (saved.unit === "words" || saved.unit === "characters");
+  const timingIsValid =
+    saved &&
+    Number.isInteger(saved.baseline) &&
+    saved.baseline >= 0 &&
+    Number.isFinite(saved.startedAt) &&
+    saved.startedAt > 0 &&
+    Number.isFinite(saved.endsAt) &&
+    saved.endsAt >= saved.startedAt;
+  const finishedIsValid =
+    saved &&
+    (saved.finished == null ||
+      ((saved.finished.reason === "goal" ||
+        saved.finished.reason === "time") &&
+        Number.isFinite(saved.finished.count) &&
+        Number.isFinite(saved.finished.elapsed)));
+
+  if (
+    !goal ||
+    !minutes ||
+    !unitIsValid ||
+    !timingIsValid ||
+    !finishedIsValid
+  ) {
+    store.del(K.session);
+    return;
+  }
+  startSession(goal, saved.unit, minutes, saved);
 }
 
 function openSession() {
@@ -1491,14 +1565,24 @@ function openSession() {
   $("goalMinutes").value = session.minutes;
   $("sessionEnd").hidden = !running;
   $("sessionStart").textContent = running ? "Restart" : "Start";
+  $("sessionError").hidden = true;
+  $("sessionError").textContent = "";
   openDialog($("sessionDlg"));
   $("goalAmount").focus();
   $("goalAmount").select();
 }
 
 $("sessionStart").addEventListener("click", () => {
-  const goal = Math.max(1, Math.round(Number($("goalAmount").value) || 0));
-  const minutes = Math.max(1, Math.round(Number($("goalMinutes").value) || 0));
+  const goal = parseBoundedInteger($("goalAmount").value, 1_000_000);
+  const minutes = parseBoundedInteger($("goalMinutes").value, 1_440);
+  if (!goal || !minutes) {
+    $("sessionError").textContent =
+      "Enter a whole-number goal from 1 to 1,000,000 and a duration from 1 to 1,440 minutes.";
+    $("sessionError").hidden = false;
+    return;
+  }
+  $("sessionError").hidden = true;
+  $("sessionError").textContent = "";
   $("sessionDlg").close();
   startSession(goal, $("goalUnit").value, minutes, null);
   editor.focus();

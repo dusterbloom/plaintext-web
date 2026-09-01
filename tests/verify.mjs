@@ -358,6 +358,29 @@ test("persistence health has an accessible visible status", () => {
   assert.match(html, /beforeunload/);
 });
 
+test("session numbers are finite bounded positive integers", () => {
+  const html = readApp();
+  const { parseBoundedInteger } = extractTestableLogic(html, [
+    "parseBoundedInteger",
+  ]);
+  assert.equal(parseBoundedInteger("1", 10), 1);
+  assert.equal(parseBoundedInteger("10", 10), 10);
+  assert.equal(parseBoundedInteger("", 10), null);
+  assert.equal(parseBoundedInteger("0", 10), null);
+  assert.equal(parseBoundedInteger("-1", 10), null);
+  assert.equal(parseBoundedInteger("1.5", 10), null);
+  assert.equal(parseBoundedInteger("1e309", 10), null);
+  assert.equal(parseBoundedInteger("11", 10), null);
+});
+
+test("session form exposes limits, errors, and a rolling window", () => {
+  const html = readApp();
+  assert.match(html, /id="goalAmount"[^>]*max="1000000"/);
+  assert.match(html, /id="goalMinutes"[^>]*max="1440"/);
+  assert.match(html, /id="sessionError"[^>]*role="alert"/);
+  assert.match(html, /windowBaseline/);
+});
+
 export {
   appPath,
   extractInlineScript,
