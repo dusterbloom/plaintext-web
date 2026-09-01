@@ -272,6 +272,17 @@ select{
   <div class="actions"><button class="btn primary" data-close>Done</button></div>
 </div></dialog>
 
+<dialog id="discardDialog" aria-labelledby="discardTitle">
+  <div class="panel">
+    <h2 id="discardTitle">Discard unsaved changes?</h2>
+    <p class="note">This replaces the current document. Your latest local recovery may also be replaced.</p>
+    <div class="actions">
+      <button class="btn" id="discardCancel" autofocus>Cancel</button>
+      <button class="btn primary" id="discardConfirm">Discard changes</button>
+    </div>
+  </div>
+</dialog>
+
 <dialog id="alert"><div class="panel" style="width:min(92vw,380px)">
   <h2>Plaintext</h2>
   <p class="note" id="alertText" style="font-size:13px"></p>
@@ -338,10 +349,26 @@ const store = (() => {
 const K = {
   theme: "plaintext.theme", font: "plaintext.font", sound: "plaintext.sound",
   count: "plaintext.showsWordCount", recovery: "plaintext.recovery",
-  name: "plaintext.documentName", history: "plaintext.history",
+  name: "plaintext.documentName", history: "plaintext.history", clean: "plaintext.clean",
   match: "plaintext.matchSystem", light: "plaintext.lightTheme",
   dark: "plaintext.darkTheme", session: "plaintext.session"
 };
+
+/* @testable:start */
+function fingerprint(text) {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return text.length.toString(36) + ":" + (hash >>> 0).toString(36);
+}
+
+function documentIsDirty(text, cleanText) {
+  if (cleanText === null) return text.length > 0;
+  return text !== cleanText;
+}
+/* @testable:end */
 
 /* ------------------------------------------------------------------ *
  * Themes and typefaces, ported from Sources/Plaintext/Models.swift
@@ -466,8 +493,15 @@ const sound = (() => {
 /* ------------------------------------------------------------------ *
  * Document state
  * ------------------------------------------------------------------ */
+const recoveredText = store.get(K.recovery) || "";
+const recoveredCleanFingerprint = store.get(K.clean);
+
 const doc = {
-  text: store.get(K.recovery) || "",
+  text: recoveredText,
+  cleanText:
+    recoveredCleanFingerprint === fingerprint(recoveredText)
+      ? recoveredText
+      : null,
   name: store.get(K.name) || "Untitled",
   handle: null,
   history: [],
@@ -522,6 +556,16 @@ function renderCount() {
 function renderTitle() {
   $("title").textContent = doc.name;
   document.title = doc.name === "Untitled" ? "Plaintext" : doc.name + " — Plaintext";
+}
+
+function isDirty() {
+  return documentIsDirty(doc.text, doc.cleanText);
+}
+
+function markClean() {
+  doc.cleanText = doc.text;
+  store.set(K.clean, fingerprint(doc.cleanText));
+  renderTitle();
 }
 
 /* ---------- edits, undo, autosave ---------- */
@@ -620,61 +664,99 @@ function writeHistory() {
   store.del(K.history);
 }
 
+async function confirmDiscard() {
+  if (!isDirty()) return true;
+  const dialog = $("discardDialog");
+  const cancel = $("discardCancel");
+  const confirm = $("discardConfirm");
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (answer) => {
+      if (settled) return;
+      settled = true;
+      cancel.removeEventListener("click", onCancel);
+      confirm.removeEventListener("click", onConfirm);
+      dialog.removeEventListener("close", onClose);
+      if (dialog.open) dialog.close();
+      resolve(answer);
+    };
+    const onCancel = () => finish(false);
+    const onConfirm = () => finish(true);
+    const onClose = () => finish(false);
+    cancel.addEventListener("click", onCancel);
+    confirm.addEventListener("click", onConfirm);
+    dialog.addEventListener("close", onClose, { once: true });
+    dialog.showModal();
+  });
+}
+
 /* ---------- files ---------- */
 const FILE_TYPES = [{
   description: "Plain text",
   accept: { "text/markdown": [".md", ".markdown"], "text/plain": [".txt", ".text"] }
 }];
 
-function newDocument() {
-  if (session.active) endSession();
+async function candidateFromFile(file, handle) {
+  return {
+    text: await file.text(),
+    name: file.name || "Untitled",
+    handle: handle || null,
+    clean: true,
+  };
+}
+
+async function replaceDocument(candidate) {
+  if (!(await confirmDiscard())) return false;
+  persistNow();
+  endSession();
   clearTimeout(doc.saveTimer);
-  doc.handle = null;
-  doc.name = "Untitled";
+  doc.name = candidate.name || "Untitled";
+  doc.handle = candidate.handle || null;
+  doc.text = candidate.text;
+  doc.cleanText = candidate.clean ? candidate.text : null;
   doc.history = [];
-  doc.text = "";
-  doc.lastSnapshot = "";
-  doc.undo.length = doc.redo.length = 0;
+  doc.lastSnapshot = candidate.text;
+  doc.undo.length = 0;
+  doc.redo.length = 0;
   doc.lastCheckpoint = 0;
+  if (doc.cleanText === null) store.del(K.clean);
+  else store.set(K.clean, fingerprint(doc.cleanText));
   store.del(K.history);
-  editor.value = "";
-  renderTitle();
+  editor.value = candidate.text;
+  try { editor.setSelectionRange(0, 0); } catch (_) {}
   renderCount();
   persistNow();
+  renderTitle();
   editor.focus();
+  return true;
+}
+
+function newDocument() {
+  return replaceDocument({
+    text: "",
+    name: "Untitled",
+    handle: null,
+    clean: true,
+  });
 }
 
 async function openDocument() {
-  if (window.showOpenFilePicker) {
-    try {
-      const [handle] = await window.showOpenFilePicker({ multiple: false, types: FILE_TYPES });
-      const file = await handle.getFile();
-      loadFile(await file.text(), file.name, handle);
-      return;
-    } catch (err) {
-      if (err && err.name === "AbortError") return;
-    }
+  if (!window.showOpenFilePicker) {
+    $("filePicker").click();
+    return;
   }
-  $("filePicker").click();
-}
-
-function loadFile(text, name, handle) {
-  if (session.active) endSession();
-  clearTimeout(doc.saveTimer);
-  doc.handle = handle || null;
-  doc.name = name;
-  doc.text = text;
-  doc.lastSnapshot = text;
-  doc.history = [];
-  doc.undo.length = doc.redo.length = 0;
-  doc.lastCheckpoint = 0;
-  store.del(K.history);
-  editor.value = text;
-  editor.setSelectionRange(0, 0);
-  renderTitle();
-  renderCount();
-  persistNow();
-  editor.focus();
+  try {
+    const [handle] = await window.showOpenFilePicker({
+      multiple: false,
+      types: FILE_TYPES,
+    });
+    const file = await handle.getFile();
+    await replaceDocument(await candidateFromFile(file, handle));
+  } catch (error) {
+    if (error && error.name === "AbortError") return;
+    showAlert("Plaintext could not open that UTF-8 plain-text file.");
+  }
 }
 
 async function save() {
@@ -853,6 +935,18 @@ $("countToggle").addEventListener("change", (e) => {
 });
 
 /* ---------- version history dialog ---------- */
+async function restoreSnapshot(snapshot) {
+  if (!(await confirmDiscard())) return false;
+  snapshotIfNeeded();
+  checkpoint(doc.text, true);
+  doc.text = snapshot.text;
+  replaceEditorText(snapshot.text);
+  doc.lastCheckpoint = 0;
+  renderCount();
+  persistNow();
+  return true;
+}
+
 function openHistory() {
   const body = $("historyBody");
   body.textContent = "";
@@ -871,9 +965,9 @@ function openHistory() {
       b.innerHTML = "<span></span><span class='meta'>Restore</span>";
       b.firstElementChild.textContent = new Date(snapshot.date)
         .toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
-      b.addEventListener("click", () => {
-        setText(snapshot.text, { force: true });
+      b.addEventListener("click", async () => {
         $("history").close();
+        await restoreSnapshot(snapshot);
       });
       li.appendChild(b);
       list.appendChild(li);
@@ -1014,26 +1108,45 @@ $("findOne").addEventListener("click", () => replaceCurrent($("findQuery").value
 $("findAll").addEventListener("click", () => replaceAll($("findQuery").value, $("findReplace").value));
 $("findClose").addEventListener("click", closeFind);
 
-$("filePicker").addEventListener("change", async (e) => {
-  const file = e.target.files && e.target.files[0];
-  if (!file) return;
-  loadFile(await file.text(), file.name, null);
-  e.target.value = "";
+$("filePicker").addEventListener("change", async (event) => {
+  const file = event.target.files && event.target.files[0];
+  try {
+    if (file) {
+      await replaceDocument(await candidateFromFile(file, null));
+    }
+  } catch (_) {
+    showAlert("Plaintext could not read that UTF-8 plain-text file.");
+  } finally {
+    event.target.value = "";
+  }
 });
 
 /* Drop a text file anywhere to open it. */
-document.addEventListener("dragover", (e) => { e.preventDefault(); });
-document.addEventListener("drop", async (e) => {
-  const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+document.addEventListener("dragover", (event) => {
+  event.preventDefault();
+});
+document.addEventListener("drop", async (event) => {
+  event.preventDefault();
+  const transfer = event.dataTransfer;
+  const file = transfer && transfer.files && transfer.files[0];
   if (!file) return;
-  e.preventDefault();
-  if (e.dataTransfer.items && e.dataTransfer.items[0].getAsFileSystemHandle) {
+
+  let handle = null;
+  const item = transfer.items && transfer.items[0];
+  if (item && typeof item.getAsFileSystemHandle === "function") {
     try {
-      const handle = await e.dataTransfer.items[0].getAsFileSystemHandle();
-      if (handle && handle.kind === "file") { loadFile(await file.text(), file.name, handle); return; }
+      const candidateHandle = await item.getAsFileSystemHandle();
+      if (candidateHandle && candidateHandle.kind === "file") {
+        handle = candidateHandle;
+      }
     } catch (_) {}
   }
-  loadFile(await file.text(), file.name, null);
+
+  try {
+    await replaceDocument(await candidateFromFile(file, handle));
+  } catch (_) {
+    showAlert("Plaintext could not read that UTF-8 plain-text file.");
+  }
 });
 
 window.addEventListener("beforeunload", persistNow);

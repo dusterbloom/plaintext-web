@@ -100,6 +100,29 @@ test("repository and standalone app retain required legal notices", () => {
   assert.match(html, /unofficial web adaptation/i);
 });
 
+test("dirty state compares exact text and fingerprints reload markers", () => {
+  const html = readApp();
+  const { documentIsDirty, fingerprint } = extractTestableLogic(html, [
+    "documentIsDirty",
+    "fingerprint",
+  ]);
+
+  assert.equal(documentIsDirty("saved", "saved"), false);
+  assert.equal(documentIsDirty("changed", "saved"), true);
+  assert.equal(documentIsDirty("", null), false);
+  assert.equal(documentIsDirty("recovered", null), true);
+  assert.notEqual(fingerprint("ab"), fingerprint("ba"));
+});
+
+test("destructive document changes have one safe guard", () => {
+  const html = readApp();
+  assert.match(html, /<dialog id="discardDialog"[^>]*aria-labelledby="discardTitle"/);
+  assert.match(html, /id="discardCancel"[^>]*autofocus/);
+  assert.match(html, /id="discardConfirm"/);
+  assert.match(html, /async function confirmDiscard\(/);
+  assert.match(html, /async function replaceDocument\(/);
+});
+
 export {
   appPath,
   extractInlineScript,
