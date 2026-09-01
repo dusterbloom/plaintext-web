@@ -954,6 +954,74 @@ function soundHarness({
   };
 }
 
+function renderErrorHarness() {
+  const contexts = [];
+  const starts = [];
+  const tapBytes = Uint8Array.of(1, 2, 3).buffer;
+
+  const createContext = () => {
+    const id = contexts.length;
+    const tapBuffer = { kind: "decoded zen press", owner: id };
+    let errorHandler = null;
+    let resolveDecode;
+    const decode = new Promise((resolve) => {
+      resolveDecode = () => resolve(tapBuffer);
+    });
+    const context = {
+      state: "running",
+      destination: {},
+      closed: false,
+      decodes: 0,
+      addEventListener(type, handler) {
+        if (type === "error") errorHandler = handler;
+      },
+      close() {
+        this.closed = true;
+        return Promise.resolve();
+      },
+      createBuffer(channels, length, rate) {
+        return {
+          channels,
+          length,
+          owner: id,
+          rate,
+          data: new Float32Array(length),
+          getChannelData() { return this.data; },
+        };
+      },
+      decodeAudioData() {
+        this.decodes += 1;
+        return decode;
+      },
+      createBufferSource() {
+        return {
+          buffer: null,
+          connect(node) { this.gainNode = node; return node; },
+          start() {
+            starts.push({
+              buffer: this.buffer,
+              context: id,
+              gain: this.gainNode.gain.value,
+            });
+          },
+        };
+      },
+      createGain() {
+        return { gain: { value: 0 }, connect() { return context.destination; } };
+      },
+    };
+    contexts.push({
+      context,
+      fireError() { if (errorHandler) errorHandler(); },
+      resolveDecode,
+      tapBuffer,
+    });
+    return context;
+  };
+
+  return { contexts, createContext, starts, tapBytes };
+}
+
 test("soft tap embeds the pinned UI SFX zen press asset", () => {
   const html = readApp();
   const script = extractInlineScript(html);
@@ -1122,6 +1190,48 @@ test("soft tap checks the live mode again after decoding", async () => {
   await new Promise(setImmediate);
 
   assert.equal(harness.starts.length, 0);
+});
+
+test("audio renderer errors discard stale work and recover on the next key", async () => {
+  const { createSoundPlayer } = extractTestableLogic(readApp(), [
+    "createSoundPlayer",
+  ]);
+  const harness = renderErrorHarness();
+  const play = createSoundPlayer(
+    () => 100,
+    harness.createContext,
+    null,
+    harness.tapBytes,
+  );
+
+  play("tap", true);
+  assert.equal(harness.contexts.length, 1);
+  assert.equal(harness.contexts[0].context.decodes, 1);
+
+  harness.contexts[0].fireError();
+  harness.contexts[0].resolveDecode();
+  await new Promise(setImmediate);
+
+  assert.equal(harness.contexts[0].context.closed, true);
+  assert.equal(harness.starts.length, 0);
+
+  play("tap", true);
+  assert.equal(harness.contexts.length, 2);
+  assert.equal(harness.contexts[1].context.decodes, 1);
+  harness.contexts[1].resolveDecode();
+  await new Promise(setImmediate);
+
+  assert.deepEqual(harness.starts, [{
+    buffer: harness.contexts[1].tapBuffer,
+    context: 1,
+    gain: 0.2,
+  }]);
+
+  play("typewriter", true);
+  assert.equal(harness.starts.length, 2);
+  assert.equal(harness.starts[1].buffer.owner, 1);
+  assert.equal(harness.starts[1].context, 1);
+  assert.equal(harness.starts[1].gain, 0.16);
 });
 
 test("key sound typing stays throttled and audio failures stay optional", async () => {

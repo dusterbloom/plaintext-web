@@ -572,6 +572,35 @@ function createSoundPlayer(now, createContext, getMode = null, tapBytes = null) 
   let tapBufferPromise = null;
   let ctx = null, last = 0, request = 0;
 
+  function discardContext(failed) {
+    if (ctx !== failed) return;
+    request += 1;
+    ctx = null;
+    tapBufferPromise = null;
+    delete buffers.typewriter;
+    try {
+      const closing = failed.close();
+      if (closing && typeof closing.catch === "function") {
+        void closing.catch(() => {});
+      }
+    } catch (_) { /* already closed or unavailable */ }
+  }
+
+  function activeContext() {
+    if (ctx && ctx.state === "closed") discardContext(ctx);
+    if (!ctx) {
+      const created = createContext();
+      const onError = () => discardContext(created);
+      if (typeof created.addEventListener === "function") {
+        created.addEventListener("error", onError, { once: true });
+      } else {
+        created.onerror = onError;
+      }
+      ctx = created;
+    }
+    return ctx;
+  }
+
   const noise = (i) => {
     let v = BigInt.asUintN(64, BigInt(i) + 0x50F7n);
     v = BigInt.asUintN(64, (v ^ (v >> 30n)) * 0xBF58476D1CE4E5B9n);
@@ -580,9 +609,9 @@ function createSoundPlayer(now, createContext, getMode = null, tapBytes = null) 
     return Number(v & 0xFFFFn) / 32767.5 - 1;
   };
 
-  function buildTypewriter() {
+  function buildTypewriter(context) {
     const count = Math.floor(RATE * 0.058);
-    const buffer = ctx.createBuffer(1, count, RATE);
+    const buffer = context.createBuffer(1, count, RATE);
     const data = buffer.getChannelData(0);
     for (let i = 0; i < count; i++) {
       const t = i / RATE;
@@ -594,13 +623,15 @@ function createSoundPlayer(now, createContext, getMode = null, tapBytes = null) 
     return buffer;
   }
 
-  function loadTap() {
+  function loadTap(context) {
     if (!tapBytes) return Promise.reject(new Error("tap audio unavailable"));
+    if (ctx !== context) return Promise.reject(new Error("stale audio context"));
     if (!tapBufferPromise) {
-      tapBufferPromise = ctx.decodeAudioData(tapBytes.slice(0)).catch((error) => {
-        tapBufferPromise = null;
+      const pending = context.decodeAudioData(tapBytes.slice(0)).catch((error) => {
+        if (tapBufferPromise === pending) tapBufferPromise = null;
         throw error;
       });
+      tapBufferPromise = pending;
     }
     return tapBufferPromise;
   }
@@ -612,25 +643,36 @@ function createSoundPlayer(now, createContext, getMode = null, tapBytes = null) 
     if (!preview && time - last < 25) return;
     last = time;
     try {
-      if (!ctx) ctx = createContext();
+      const context = activeContext();
       const start = () => {
+        if (
+          ctx !== context
+          || current !== request
+          || (getMode && getMode() !== mode)
+        ) return;
         const emit = (buffer, value) => {
-          if (current !== request || (getMode && getMode() !== mode)) return;
-          const src = ctx.createBufferSource();
-          const gain = ctx.createGain();
+          if (
+            ctx !== context
+            || current !== request
+            || (getMode && getMode() !== mode)
+          ) return;
+          const src = context.createBufferSource();
+          const gain = context.createGain();
           gain.gain.value = value;
           src.buffer = buffer;
-          src.connect(gain).connect(ctx.destination);
+          src.connect(gain).connect(context.destination);
           src.start();
         };
         if (mode === "tap") {
-          void loadTap().then((buffer) => emit(buffer, 0.2)).catch(() => {});
+          void loadTap(context).then((buffer) => emit(buffer, 0.2)).catch(() => {});
           return;
         }
-        if (!buffers.typewriter) buffers.typewriter = buildTypewriter();
+        if (!buffers.typewriter) buffers.typewriter = buildTypewriter(context);
         emit(buffers.typewriter, 0.16);
       };
-      if (ctx.state === "suspended") void ctx.resume().then(start).catch(() => {});
+      if (context.state === "suspended") {
+        void context.resume().then(start).catch(() => {});
+      }
       else start();
     } catch (_) { /* audio unavailable; typing continues */ }
   };
