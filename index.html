@@ -15,17 +15,20 @@
 
 :root{
   --bg:#f6f3ec; --fg:#211f1a; --sec:#666157; --sel:#ccc4ad;
+  --safe-top:env(safe-area-inset-top,0px); --safe-right:env(safe-area-inset-right,0px);
+  --safe-bottom:env(safe-area-inset-bottom,0px); --safe-left:env(safe-area-inset-left,0px);
   --serif:"Literata",Georgia,"Iowan Old Style",serif;
   --sans:"Work Sans",-apple-system,"Segoe UI",Helvetica,Arial,sans-serif;
   --ui:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
   --editor:var(--serif);
 }
 *{box-sizing:border-box}
-html,body{height:100%}
+html,body{height:100%; min-height:100vh; min-height:100svh; min-height:100dvh}
 body{
   margin:0; background:var(--bg); color:var(--fg);
   font-family:var(--ui); -webkit-font-smoothing:antialiased;
   overflow:hidden; overscroll-behavior:none;
+  padding:var(--safe-top) var(--safe-right) var(--safe-bottom) var(--safe-left);
 }
 ::selection{background:var(--sel); color:var(--fg)}
 
@@ -78,18 +81,18 @@ body{
 
 /* Text dissolves into the page before it can collide with the readouts. */
 .fade{
-  position:fixed; left:0; right:0; bottom:0; height:76px; z-index:2; pointer-events:none;
+  position:fixed; left:0; right:0; bottom:var(--safe-bottom); height:76px; z-index:2; pointer-events:none;
   background:linear-gradient(to top,var(--bg) 0,var(--bg) 34%,transparent 100%);
 }
 
 .clock{
-  position:fixed; left:25px; bottom:16px; z-index:3;
+  position:fixed; left:calc(25px + var(--safe-left)); bottom:calc(16px + var(--safe-bottom)); z-index:3;
   font-size:12px; font-weight:500; color:color-mix(in srgb,var(--fg) 76%,var(--bg));
   font-variant-numeric:tabular-nums; pointer-events:none; user-select:none;
 }
 .clock[hidden]{display:none}
 
-.pace{position:fixed; left:0; right:0; bottom:0; height:3px; pointer-events:none; z-index:3}
+.pace{position:fixed; left:var(--safe-left); right:var(--safe-right); bottom:var(--safe-bottom); height:3px; pointer-events:none; z-index:3}
 .pace[hidden]{display:none}
 .pace .track,.pace .fill{position:absolute; left:0; bottom:0; height:1px}
 .pace .track{right:0; background:color-mix(in srgb,var(--sec) 14%,transparent)}
@@ -98,7 +101,7 @@ body{
   background:color-mix(in srgb,var(--fg) 55%,transparent)}
 
 .count{
-  position:fixed; right:25px; bottom:16px; z-index:3;
+  position:fixed; right:calc(25px + var(--safe-right)); bottom:calc(16px + var(--safe-bottom)); z-index:3;
   font-size:12px; font-weight:500; color:color-mix(in srgb,var(--fg) 76%,var(--bg));
   font-variant-numeric:tabular-nums; pointer-events:none; user-select:none;
 }
@@ -107,13 +110,13 @@ body{
 
 /* ---------- find bar ---------- */
 .find{
-  position:fixed; top:43px; left:50%; transform:translateX(-50%); z-index:5;
+  position:fixed; top:calc(43px + var(--safe-top)); left:var(--safe-left); right:var(--safe-right); margin:0 auto; z-index:5;
   display:flex; gap:8px; align-items:center;
   padding:9px 12px; border-radius:10px;
   background:var(--bg); border:1px solid color-mix(in srgb,var(--sec) 22%,transparent);
   box-shadow:0 8px 20px rgba(0,0,0,.12);
   font-size:12px; font-weight:500; color:var(--fg);
-  max-width:calc(100vw - 32px); flex-wrap:wrap;
+  width:max-content; max-width:calc(100vw - var(--safe-left) - var(--safe-right) - 32px); flex-wrap:wrap;
 }
 body.dark .find{box-shadow:0 8px 20px rgba(0,0,0,.35)}
 .find[hidden]{display:none}
@@ -140,6 +143,7 @@ button{font:inherit; color:inherit}
 dialog{
   padding:0; border:0; background:transparent; color:var(--fg); max-width:none; max-height:none;
 }
+dialog .panel{max-height:calc(100dvh - 2rem - var(--safe-top) - var(--safe-bottom)); overflow:auto}
 dialog::backdrop{background:rgba(0,0,0,.28)}
 body.dark dialog::backdrop{background:rgba(0,0,0,.5)}
 .panel{
@@ -219,9 +223,25 @@ select{
 @media (max-width:640px){
   .wrap{padding:0 6px}
   #editor,#ghost{padding:40px 14px; font-size:18px}
-  .clock{left:14px}
-  .count{right:14px}
+  .clock{left:calc(14px + var(--safe-left))}
+  .count{right:calc(14px + var(--safe-right))}
   .title{padding-top:12px}
+}
+@media (max-width:600px){
+  input,select,textarea{font-size:max(16px,1em)}
+  .find{display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto; gap:.5rem; width:calc(100vw - var(--safe-left) - var(--safe-right) - 32px)}
+  .find input{width:auto; max-width:none; min-width:0}
+}
+@media (pointer:coarse){
+  button,select,input:not([type="checkbox"]):not([type="radio"]){min-height:44px}
+  .title{min-width:44px; min-height:44px}
+}
+@media (max-height:500px) and (orientation:landscape){
+  #editor,#ghost{padding-top:2.5rem; padding-bottom:calc(2.5rem + var(--safe-bottom))}
+}
+@media (forced-colors:active){
+  button,input,select,dialog{border:1px solid ButtonText}
+  :focus-visible{outline:2px solid Highlight!important; outline-offset:2px}
 }
 @media (prefers-reduced-motion:reduce){*{transition:none!important; animation:none!important}}
 </style>
@@ -481,9 +501,9 @@ function isValidFinishedSession(finished, goal, minutes) {
 const THEMES = {
   paper:     { name: "Paper",     dark: false, bg: "#f6f3ec", fg: "#211f1a", sec: "#666157", sel: "#ccc4ad" },
   snow:      { name: "Snow",      dark: false, bg: "#ffffff", fg: "#0d0d0d", sec: "#575757", sel: "#b8cff5" },
-  linen:     { name: "Linen",     dark: false, bg: "#e8e0d1", fg: "#38332b", sec: "#70695c", sel: "#c2b399" },
+  linen:     { name: "Linen",     dark: false, bg: "#e8e0d1", fg: "#38332b", sec: "#665f53", sel: "#c2b399" },
   ink:       { name: "Ink",       dark: true,  bg: "#0e0f11", fg: "#f0f0eb", sec: "#9ea19c", sel: "#3d5775" },
-  graphite:  { name: "Graphite",  dark: true,  bg: "#21211f", fg: "#c2bfb8", sec: "#85827a", sel: "#4f4d45" },
+  graphite:  { name: "Graphite",  dark: true,  bg: "#21211f", fg: "#c2bfb8", sec: "#918e85", sel: "#4f4d45" },
   midnight:  { name: "Midnight",  dark: true,  bg: "#0f161c", fg: "#c7d4db", sec: "#7a8f9c", sel: "#2b4757" }
 };
 

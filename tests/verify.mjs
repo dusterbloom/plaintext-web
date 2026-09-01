@@ -679,6 +679,51 @@ test("session form exposes limits, errors, and a rolling window", () => {
   assert.match(html, /windowBaseline/);
 });
 
+function channel(value) {
+  const normalized = value / 255;
+  return normalized <= 0.04045
+    ? normalized / 12.92
+    : ((normalized + 0.055) / 1.055) ** 2.4;
+}
+
+function luminance(hex) {
+  const parts = hex.match(/[0-9a-f]{2}/gi).map((part) => parseInt(part, 16));
+  return 0.2126 * channel(parts[0]) +
+    0.7152 * channel(parts[1]) +
+    0.0722 * channel(parts[2]);
+}
+
+function contrast(a, b) {
+  const light = Math.max(luminance(a), luminance(b));
+  const dark = Math.min(luminance(a), luminance(b));
+  return (light + 0.05) / (dark + 0.05);
+}
+
+test("secondary theme text meets normal-text contrast", () => {
+  const html = readApp();
+  const script = extractInlineScript(html);
+  const themes = [...script.matchAll(
+    /\b(linen|graphite):\s*\{[^}]*bg:\s*"(#[0-9a-f]{6})"[^}]*sec:\s*"(#[0-9a-f]{6})"/gi,
+  )];
+  assert.equal(themes.length, 2);
+  for (const [, name, background, secondary] of themes) {
+    assert.ok(
+      contrast(background, secondary) >= 4.5,
+      name + " secondary text is below 4.5:1",
+    );
+  }
+});
+
+test("layout accounts for dynamic viewports and device safe areas", () => {
+  const html = readApp();
+  assert.match(html, /100svh/);
+  assert.match(html, /100dvh/);
+  assert.match(html, /env\(safe-area-inset-top/);
+  assert.match(html, /env\(safe-area-inset-bottom/);
+  assert.match(html, /pointer:\s*coarse/);
+  assert.match(html, /forced-colors:\s*active/);
+});
+
 export {
   appPath,
   extractInlineScript,
