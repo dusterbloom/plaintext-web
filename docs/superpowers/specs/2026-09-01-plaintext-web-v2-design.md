@@ -253,8 +253,9 @@ The repository retains the upstream MIT copyright and licence, identifies the
 web modifications separately, and includes the upstream third-party notices.
 Because the four SIL OFL fonts are embedded in the distributable HTML, the
 standalone file includes the relevant attribution and complete MIT/OFL licence
-texts in a non-rendered source comment. Repository copies remain available for
-normal human reading.
+texts in a non-rendered inert template element. A comment cannot safely hold
+the exact OFL text because that text contains double hyphens, which HTML comment
+syntax forbids. Repository copies remain available for normal human reading.
 
 ## Verification
 
