@@ -231,16 +231,17 @@ select{
   input,select,textarea{font-size:max(16px,1em)}
   .find{display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto; gap:.5rem; width:calc(100vw - var(--safe-left) - var(--safe-right) - 32px)}
   .find input{width:auto; max-width:none; min-width:0}
+  .find input,input.num{font-size:max(16px,1em)}
 }
 @media (pointer:coarse){
   button,select,input:not([type="checkbox"]):not([type="radio"]){min-height:44px}
   .title{min-width:44px; min-height:44px}
 }
 @media (max-height:500px) and (orientation:landscape){
-  #editor,#ghost{padding-top:2.5rem; padding-bottom:calc(2.5rem + var(--safe-bottom))}
+  #editor,#ghost{padding-top:2.5rem; padding-bottom:2.5rem}
 }
 @media (forced-colors:active){
-  button,input,select,dialog{border:1px solid ButtonText}
+  button,input,select,dialog,.panel{border:1px solid ButtonText!important}
   :focus-visible{outline:2px solid Highlight!important; outline-offset:2px}
 }
 @media (prefers-reduced-motion:reduce){*{transition:none!important; animation:none!important}}

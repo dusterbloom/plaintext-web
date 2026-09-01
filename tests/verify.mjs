@@ -724,6 +724,33 @@ test("layout accounts for dynamic viewports and device safe areas", () => {
   assert.match(html, /forced-colors:\s*active/);
 });
 
+test("mobile form overrides beat existing find and number field typography", () => {
+  const html = readApp();
+  const mobile = html.match(/@media \(max-width:600px\)\{([\s\S]*?)\n\}/);
+  assert.ok(mobile, "mobile form media query missing");
+  assert.match(mobile[1], /\.find input,input\.num\{font-size:max\(16px,1em\)\}/);
+});
+
+test("forced colors overrides component borders", () => {
+  const html = readApp();
+  const forced = html.match(/@media \(forced-colors:active\)\{([\s\S]*?)\n\}/);
+  assert.ok(forced, "forced-colors media query missing");
+  assert.match(
+    forced[1],
+    /button,input,select,dialog,\.panel\{border:1px solid ButtonText!important\}/,
+  );
+});
+
+test("short landscape editor padding does not repeat the safe-area inset", () => {
+  const html = readApp();
+  const landscape = html.match(
+    /@media \(max-height:500px\) and \(orientation:landscape\)\{([\s\S]*?)\n\}/,
+  );
+  assert.ok(landscape, "short-landscape media query missing");
+  assert.match(landscape[1], /padding-bottom:2\.5rem/);
+  assert.doesNotMatch(landscape[1], /safe-bottom/);
+});
+
 export {
   appPath,
   extractInlineScript,
