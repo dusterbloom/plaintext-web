@@ -123,6 +123,103 @@ test("destructive document changes have one safe guard", () => {
   assert.match(html, /async function replaceDocument\(/);
 });
 
+test("recovery write trims history once before giving up", () => {
+  const html = readApp();
+  const { writeRecoveryWithFallback } = extractTestableLogic(html, [
+    "writeRecoveryWithFallback",
+  ]);
+  const keys = { recovery: "r", history: "h" };
+
+  const healthy = new Map();
+  const healthyStore = {
+    set(key, value) {
+      healthy.set(key, value);
+      return true;
+    },
+    del(key) {
+      healthy.delete(key);
+    },
+  };
+  const first = writeRecoveryWithFallback(
+    healthyStore,
+    keys,
+    "current",
+    [1, 2, 3, 4],
+  );
+  assert.deepEqual(first, {
+    ok: true,
+    history: [1, 2, 3, 4],
+    trimmed: false,
+  });
+
+  let recoveryAttempts = 0;
+  const quotaStore = {
+    set(key) {
+      if (key === "r") {
+        recoveryAttempts += 1;
+        return recoveryAttempts > 1;
+      }
+      return true;
+    },
+    del() {},
+  };
+  const retried = writeRecoveryWithFallback(
+    quotaStore,
+    keys,
+    "current",
+    [1, 2, 3, 4],
+  );
+  assert.deepEqual(retried, { ok: true, history: [1, 2], trimmed: true });
+
+  const failedStore = { set: () => false, del() {} };
+  const failed = writeRecoveryWithFallback(
+    failedStore,
+    keys,
+    "current",
+    [1, 2, 3, 4],
+  );
+  assert.deepEqual(failed, { ok: false, history: [1, 2], trimmed: true });
+});
+
+test("file writer closes only after writing exact text", async () => {
+  const html = readApp();
+  const { writeToHandle } = extractTestableLogic(html, ["writeToHandle"]);
+  const calls = [];
+  const handle = {
+    async createWritable() {
+      calls.push("create");
+      return {
+        async write(text) {
+          calls.push(["write", text]);
+        },
+        async close() {
+          calls.push("close");
+        },
+      };
+    },
+  };
+
+  await writeToHandle(handle, "current");
+  assert.deepEqual(calls, ["create", ["write", "current"], "close"]);
+});
+
+test("abort detection recognizes only browser cancellation errors", () => {
+  const html = readApp();
+  const { isAbort } = extractTestableLogic(html, ["isAbort"]);
+
+  assert.equal(isAbort({ name: "AbortError" }), true);
+  assert.equal(isAbort(new Error("disk full")), false);
+  assert.equal(isAbort(null), null);
+});
+
+test("persistence health has an accessible visible status", () => {
+  const html = readApp();
+  assert.match(html, /id="persistenceStatus"[^>]*role="status"/);
+  assert.match(html, /Local recovery unavailable—save to a file\./);
+  assert.match(html, /pagehide/);
+  assert.match(html, /beforeunload/);
+});
+
 export {
   appPath,
   extractInlineScript,

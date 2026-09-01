@@ -43,6 +43,13 @@ body{
 .title:hover{opacity:1}
 .title:focus-visible{outline:1px solid var(--sec); outline-offset:4px; border-radius:3px}
 
+.persistence-status{
+  flex:none; align-self:center; max-width:min(90vw,560px); margin:8px 16px 0;
+  padding:6px 10px; border-radius:7px; text-align:center;
+  color:var(--fg); background:color-mix(in srgb,var(--sec) 13%,transparent);
+  font-size:12px; line-height:1.4;
+}
+
 .wrap{flex:1; min-height:0; width:100%; max-width:760px; margin:0 auto; padding:0 28px}
 .stack{position:relative; height:100%}
 
@@ -223,6 +230,7 @@ select{
 
 <div class="shell">
   <button class="title" id="title" title="Command palette">Untitled</button>
+  <div id="persistenceStatus" class="persistence-status" role="status" aria-live="polite" hidden></div>
   <div class="wrap">
     <div class="stack">
       <div id="ghost" aria-hidden="true" hidden><span id="ghostText"></span><span id="ghostFill"></span></div>
@@ -339,10 +347,21 @@ const store = (() => {
   let live = false;
   try { localStorage.setItem("plaintext.probe", "1"); localStorage.removeItem("plaintext.probe"); live = true; } catch (_) {}
   return {
-    live,
     get(k)    { if (live) { try { return localStorage.getItem(k); } catch (_) {} } return mem.has(k) ? mem.get(k) : null; },
-    set(k, v) { mem.set(k, v); if (live) { try { localStorage.setItem(k, v); return true; } catch (_) { return false; } } return true; },
-    del(k)    { mem.delete(k); if (live) { try { localStorage.removeItem(k); } catch (_) {} } }
+    set(key, value) {
+      mem.set(key, value);
+      if (!live) return false;
+      try {
+        localStorage.setItem(key, value);
+        return true;
+      } catch (_) {
+        return false;
+      }
+    },
+    del(k)    { mem.delete(k); if (live) { try { localStorage.removeItem(k); } catch (_) {} } },
+    live() {
+      return live;
+    },
   };
 })();
 
@@ -367,6 +386,34 @@ function fingerprint(text) {
 function documentIsDirty(text, cleanText) {
   if (cleanText === null) return text.length > 0;
   return text !== cleanText;
+}
+
+function writeRecoveryWithFallback(storage, keys, text, history) {
+  if (storage.set(keys.recovery, text)) {
+    return { ok: true, history, trimmed: false };
+  }
+
+  const keepCount = Math.ceil(history.length / 2);
+  const shortened = history.slice(0, keepCount);
+  if (!storage.set(keys.history, JSON.stringify(shortened))) {
+    storage.del(keys.history);
+  }
+
+  return {
+    ok: storage.set(keys.recovery, text),
+    history: shortened,
+    trimmed: true,
+  };
+}
+
+async function writeToHandle(handle, text) {
+  const writable = await handle.createWritable();
+  await writable.write(text);
+  await writable.close();
+}
+
+function isAbort(error) {
+  return error && error.name === "AbortError";
 }
 /* @testable:end */
 
@@ -515,6 +562,11 @@ const doc = {
 try { doc.history = JSON.parse(store.get(K.history) || "[]"); } catch (_) { doc.history = []; }
 doc.lastSnapshot = doc.history.length ? doc.history[0].text : doc.text;
 
+const persistence = {
+  healthy: store.live(),
+  historyPaused: !store.live(),
+};
+
 /* ---------- rendering ---------- */
 function applyTheme() {
   const t = THEMES[resolveTheme()] || THEMES.paper;
@@ -558,13 +610,32 @@ function renderTitle() {
   document.title = doc.name === "Untitled" ? "Plaintext" : doc.name + " — Plaintext";
 }
 
+function renderPersistenceStatus(message) {
+  const status = $("persistenceStatus");
+  status.textContent = message || "";
+  status.hidden = !message;
+}
+
+function setPersistenceHealth(ok, trimmed) {
+  persistence.healthy = ok;
+  persistence.historyPaused = !ok;
+  if (!ok) {
+    renderPersistenceStatus("Local recovery unavailable—save to a file.");
+  } else if (trimmed) {
+    renderPersistenceStatus(
+      "Current text recovered; older versions were removed to make space.",
+    );
+  } else {
+    renderPersistenceStatus("");
+  }
+}
+
 function isDirty() {
   return documentIsDirty(doc.text, doc.cleanText);
 }
 
 function markClean() {
   doc.cleanText = doc.text;
-  store.set(K.clean, fingerprint(doc.cleanText));
   renderTitle();
 }
 
@@ -633,9 +704,27 @@ function schedulePersist() {
 
 function persistNow() {
   clearTimeout(doc.saveTimer);
-  store.set(K.recovery, doc.text);
+  const recovery = writeRecoveryWithFallback(
+    store,
+    K,
+    doc.text,
+    doc.history,
+  );
+  doc.history = recovery.history;
+  setPersistenceHealth(recovery.ok, recovery.trimmed);
+
   store.set(K.name, doc.name);
-  snapshotIfNeeded();
+  if (doc.cleanText === null) {
+    store.del(K.clean);
+  } else {
+    store.set(K.clean, fingerprint(doc.cleanText));
+  }
+
+  if (!persistence.historyPaused && !recovery.trimmed) {
+    snapshotIfNeeded();
+    trimHistory();
+    writeHistory();
+  }
 }
 
 /* ---------- version history ---------- */
@@ -643,8 +732,6 @@ function snapshotIfNeeded() {
   if (doc.text === doc.lastSnapshot) return;
   doc.history.unshift({ date: Date.now(), text: doc.text });
   doc.lastSnapshot = doc.text;
-  trimHistory();
-  writeHistory();
 }
 
 function trimHistory() {
@@ -720,9 +807,6 @@ async function replaceDocument(candidate) {
   doc.undo.length = 0;
   doc.redo.length = 0;
   doc.lastCheckpoint = 0;
-  if (doc.cleanText === null) store.del(K.clean);
-  else store.set(K.clean, fingerprint(doc.cleanText));
-  store.del(K.history);
   editor.value = candidate.text;
   try { editor.setSelectionRange(0, 0); } catch (_) {}
   renderCount();
@@ -741,6 +825,14 @@ function newDocument() {
   });
 }
 
+function fileError(action, error) {
+  if (isAbort(error)) return;
+  showAlert(
+    "Could not " + action + " this UTF-8 plain-text file. " +
+    (error && error.message ? error.message : "The browser did not provide a reason."),
+  );
+}
+
 async function openDocument() {
   if (!window.showOpenFilePicker) {
     $("filePicker").click();
@@ -754,46 +846,57 @@ async function openDocument() {
     const file = await handle.getFile();
     await replaceDocument(await candidateFromFile(file, handle));
   } catch (error) {
-    if (error && error.name === "AbortError") return;
-    showAlert("Plaintext could not open that UTF-8 plain-text file.");
+    fileError("open", error);
   }
 }
 
 async function save() {
   if (!doc.handle) return saveAs();
   try {
-    const writable = await doc.handle.createWritable();
-    await writable.write(doc.text);
-    await writable.close();
+    await writeToHandle(doc.handle, doc.text);
+    markClean();
     persistNow();
     editor.focus();
-  } catch (_) {
-    showAlert("Plaintext could not save \u201c" + doc.name + "\u201d.");
+  } catch (error) {
+    fileError("save", error);
   }
 }
 
 async function saveAs() {
   const suggested = doc.name === "Untitled" ? "Untitled.md" : doc.name;
-  if (window.showSaveFilePicker) {
+  if (!window.showSaveFilePicker) {
     try {
-      const handle = await window.showSaveFilePicker({ suggestedName: suggested, types: FILE_TYPES });
-      doc.handle = handle;
-      doc.name = handle.name;
-      renderTitle();
-      await save();
-      return;
-    } catch (err) {
-      if (err && err.name === "AbortError") return;
+      downloadCopy(suggested);
+    } catch (error) {
+      fileError("download", error);
     }
+    return;
   }
+  try {
+    const handle = await window.showSaveFilePicker({
+      suggestedName: suggested,
+      types: FILE_TYPES,
+    });
+    await writeToHandle(handle, doc.text);
+    doc.handle = handle;
+    doc.name = handle.name || suggested;
+    markClean();
+    renderTitle();
+    persistNow();
+    editor.focus();
+  } catch (error) {
+    fileError("save", error);
+  }
+}
+
+function downloadCopy(suggested) {
   const url = URL.createObjectURL(new Blob([doc.text], { type: "text/markdown;charset=utf-8" }));
   const link = document.createElement("a");
   link.href = url;
   link.download = suggested;
   link.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
-  doc.name = suggested;
-  renderTitle();
+  markClean();
   persistNow();
   editor.focus();
 }
@@ -910,7 +1013,7 @@ function buildSettings() {
   $("soundToggle").checked = settings.sound;
   $("countToggle").checked = settings.count;
 
-  if (!store.live) {
+  if (!store.live()) {
     $("storageNote").hidden = false;
     $("storageNote").textContent =
       "This browser is blocking local storage, so settings, autosave, and version history last only for this session. Save the file to disk to keep your work.";
@@ -982,7 +1085,12 @@ const COMMANDS = [
   { title: "New document",            keys: CMD + "N",            run: newDocument },
   { title: "Open document",           keys: CMD + "O",            run: openDocument },
   { title: "Save",                    keys: CMD + "S",            run: save },
-  { title: "Save as",                 keys: SHIFT + CMD + "S",    run: saveAs },
+  {
+    title: () =>
+      window.showSaveFilePicker ? "Save As" : "Download a copy",
+    keys: SHIFT + CMD + "S",
+    run: saveAs,
+  },
   { title: "Find and replace",        keys: CMD + "F",            run: openFind },
   { title: "Restore earlier version", keys: SHIFT + CMD + "H",    run: openHistory },
   { title: () => (session.active ? "End writing session" : "Writing session\u2026"), keys: SHIFT + CMD + "G",
@@ -1114,8 +1222,8 @@ $("filePicker").addEventListener("change", async (event) => {
     if (file) {
       await replaceDocument(await candidateFromFile(file, null));
     }
-  } catch (_) {
-    showAlert("Plaintext could not read that UTF-8 plain-text file.");
+  } catch (error) {
+    fileError("read", error);
   } finally {
     event.target.value = "";
   }
@@ -1144,13 +1252,22 @@ document.addEventListener("drop", async (event) => {
 
   try {
     await replaceDocument(await candidateFromFile(file, handle));
-  } catch (_) {
-    showAlert("Plaintext could not read that UTF-8 plain-text file.");
+  } catch (error) {
+    fileError("read", error);
   }
 });
 
-window.addEventListener("beforeunload", persistNow);
-document.addEventListener("visibilitychange", () => { if (document.hidden) persistNow(); });
+window.addEventListener("pagehide", persistNow);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") persistNow();
+});
+window.addEventListener("beforeunload", (event) => {
+  persistNow();
+  if (!persistence.healthy && isDirty()) {
+    event.preventDefault();
+    event.returnValue = "";
+  }
+});
 document.addEventListener("click", (e) => {
   if (!e.target.closest("button,input,select,dialog,label")) editor.focus();
 });
@@ -1377,6 +1494,7 @@ applyTheme();
 buildSettings();
 editor.value = doc.text;
 renderTitle();
+setPersistenceHealth(persistence.healthy, false);
 restoreSession();
 renderCount();
 editor.setSelectionRange(doc.text.length, doc.text.length);
