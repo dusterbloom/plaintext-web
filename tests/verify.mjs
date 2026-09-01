@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import test from "node:test";
@@ -155,6 +156,7 @@ function savedSession(overrides = {}) {
 const legalFiles = [
   "LICENSE",
   "THIRD_PARTY_NOTICES.md",
+  "ThirdPartyLicenses/UISFX-CC0.txt",
   "ThirdPartyLicenses/AtkinsonHyperlegible-OFL.txt",
   "ThirdPartyLicenses/Literata-OFL.txt",
   "ThirdPartyLicenses/Newsreader-OFL.txt",
@@ -875,15 +877,30 @@ test("settings expose one accessible three-state key sound selector", () => {
   assert.doesNotMatch(html, /id="soundToggle"/);
 });
 
-function soundHarness({ state = "running", times = [100], throwOnBuffer = false } = {}) {
+function soundHarness({
+  state = "running",
+  times = [100],
+  throwOnBuffer = false,
+  throwOnSource = false,
+} = {}) {
   let resolveResume;
   let rejectResume;
+  let resolveDecode;
+  let rejectDecode;
   let timeIndex = 0;
+  let decodes = 0;
   const starts = [];
   const buffers = [];
+  const decodedBytes = [];
+  const tapBuffer = { kind: "decoded zen press" };
+  const tapBytes = Uint8Array.of(1, 2, 3).buffer;
   const resume = new Promise((resolve, reject) => {
     resolveResume = resolve;
     rejectResume = reject;
+  });
+  const decode = new Promise((resolve, reject) => {
+    resolveDecode = () => resolve(tapBuffer);
+    rejectDecode = reject;
   });
   const context = {
     state,
@@ -900,7 +917,13 @@ function soundHarness({ state = "running", times = [100], throwOnBuffer = false 
       buffers.push(buffer);
       return buffer;
     },
+    decodeAudioData(bytes) {
+      decodes += 1;
+      decodedBytes.push(bytes);
+      return decode;
+    },
     createBufferSource() {
+      if (throwOnSource) throw new Error("audio source unavailable");
       return {
         buffer: null,
         connect(node) { this.gainNode = node; return node; },
@@ -918,28 +941,91 @@ function soundHarness({ state = "running", times = [100], throwOnBuffer = false 
     buffers,
     context,
     createContext: () => context,
+    decodedBytes,
+    get decodes() { return decodes; },
     now: () => times[Math.min(timeIndex++, times.length - 1)],
+    rejectDecode,
     rejectResume,
+    resolveDecode,
     resolveResume,
     starts,
+    tapBuffer,
+    tapBytes,
   };
 }
 
-test("key sound engine dispatches distinct typewriter and tap buffers", () => {
+test("soft tap embeds the pinned UI SFX zen press asset", () => {
+  const html = readApp();
+  const script = extractInlineScript(html);
+  const match = html.match(/const TAP_AUDIO_BASE64 = "([A-Za-z0-9+/=]+)";/);
+  assert.ok(match, "embedded zen press MP3 is missing");
+  const bytes = Buffer.from(match[1], "base64");
+  assert.equal(bytes.length, 1714);
+  assert.equal(
+    createHash("sha256").update(bytes).digest("hex"),
+    "e323f95066734d3fccbb369d18699aba97ac4cea62f09a3fcfa5b27e7c9843a2",
+  );
+  assert.match(html, /romainsimon\/uisfx/);
+  assert.match(html, /packages\/uisfx\/sounds\/zen\/press\.mp3/);
+  assert.match(html, /99d287a1d27ef49c02a5262184a7fda91612321e/);
+  assert.match(html, /CC0 1\.0/);
+  assert.doesNotMatch(script, /function buildTap\s*\(/);
+});
+
+test("base64 decoder returns the exact local bytes", () => {
+  const { decodeBase64 } = extractTestableLogic(readApp(), ["decodeBase64"]);
+  const bytes = new Uint8Array(decodeBase64("AAEC/w==", atob));
+  assert.deepEqual([...bytes], [0, 1, 2, 255]);
+});
+
+test("soft tap decodes once, reuses its buffer, and starts at gain 0.2", async () => {
+  const { createSoundPlayer } = extractTestableLogic(readApp(), [
+    "createSoundPlayer",
+  ]);
+  const harness = soundHarness({ times: [100, 130] });
+  const play = createSoundPlayer(
+    harness.now,
+    harness.createContext,
+    null,
+    harness.tapBytes,
+  );
+
+  play("tap", true);
+  assert.equal(harness.decodes, 1);
+  assert.equal(harness.starts.length, 0);
+  harness.resolveDecode();
+  await new Promise(setImmediate);
+  play("tap", true);
+  await new Promise(setImmediate);
+
+  assert.equal(harness.starts.length, 2);
+  assert.equal(harness.decodes, 1);
+  assert.deepEqual([...new Uint8Array(harness.decodedBytes[0])], [1, 2, 3]);
+  assert.deepEqual(harness.starts.map(({ buffer }) => buffer), [
+    harness.tapBuffer,
+    harness.tapBuffer,
+  ]);
+  assert.deepEqual(harness.starts.map(({ gain }) => gain), [0.2, 0.2]);
+});
+
+test("typewriter starts immediately without decoding soft tap", () => {
   const { createSoundPlayer } = extractTestableLogic(readApp(), [
     "createSoundPlayer",
   ]);
   const harness = soundHarness();
-  const play = createSoundPlayer(harness.now, harness.createContext);
+  const play = createSoundPlayer(
+    harness.now,
+    harness.createContext,
+    null,
+    harness.tapBytes,
+  );
 
   play("typewriter", true);
-  play("tap", true);
 
-  assert.equal(harness.starts.length, 2);
-  assert.notEqual(harness.starts[0].buffer, harness.starts[1].buffer);
+  assert.equal(harness.starts.length, 1);
   assert.equal(harness.starts[0].buffer.length, Math.floor(44100 * 0.058));
-  assert.equal(harness.starts[1].buffer.length, Math.floor(44100 * 0.040));
-  assert.deepEqual(harness.starts.map(({ gain }) => gain), [0.16, 0.12]);
+  assert.equal(harness.starts[0].gain, 0.16);
+  assert.equal(harness.decodes, 0);
 });
 
 test("key sound engine resumes only the latest pending choice", async () => {
@@ -947,22 +1033,34 @@ test("key sound engine resumes only the latest pending choice", async () => {
     "createSoundPlayer",
   ]);
   const harness = soundHarness({ state: "suspended" });
-  const play = createSoundPlayer(harness.now, harness.createContext);
+  const play = createSoundPlayer(
+    harness.now,
+    harness.createContext,
+    null,
+    harness.tapBytes,
+  );
 
   play("typewriter", true);
   play("tap", true);
   harness.resolveResume();
   await new Promise(setImmediate);
+  harness.resolveDecode();
+  await new Promise(setImmediate);
 
   assert.equal(harness.starts.length, 1);
-  assert.equal(harness.starts[0].buffer.length, Math.floor(44100 * 0.040));
-  assert.equal(harness.starts[0].gain, 0.12);
+  assert.equal(harness.starts[0].buffer, harness.tapBuffer);
+  assert.equal(harness.starts[0].gain, 0.2);
 
   const keys = soundHarness({
     state: "suspended",
     times: [100, 130, 160],
   });
-  const playKey = createSoundPlayer(keys.now, keys.createContext);
+  const playKey = createSoundPlayer(
+    keys.now,
+    keys.createContext,
+    null,
+    keys.tapBytes,
+  );
   playKey("typewriter");
   playKey("typewriter");
   playKey("typewriter");
@@ -976,7 +1074,12 @@ test("turning key sound off cancels pending playback", async () => {
     "createSoundPlayer",
   ]);
   const harness = soundHarness({ state: "suspended" });
-  const play = createSoundPlayer(harness.now, harness.createContext);
+  const play = createSoundPlayer(
+    harness.now,
+    harness.createContext,
+    null,
+    harness.tapBytes,
+  );
 
   play("typewriter", true);
   play("off", true);
@@ -991,6 +1094,7 @@ test("turning key sound off cancels pending playback", async () => {
     implicit.now,
     implicit.createContext,
     () => currentMode,
+    implicit.tapBytes,
   );
   playCurrent();
   currentMode = "off";
@@ -999,12 +1103,38 @@ test("turning key sound off cancels pending playback", async () => {
   assert.equal(implicit.starts.length, 0);
 });
 
+test("soft tap checks the live mode again after decoding", async () => {
+  const { createSoundPlayer } = extractTestableLogic(readApp(), [
+    "createSoundPlayer",
+  ]);
+  let currentMode = "tap";
+  const harness = soundHarness();
+  const play = createSoundPlayer(
+    harness.now,
+    harness.createContext,
+    () => currentMode,
+    harness.tapBytes,
+  );
+
+  play();
+  currentMode = "off";
+  harness.resolveDecode();
+  await new Promise(setImmediate);
+
+  assert.equal(harness.starts.length, 0);
+});
+
 test("key sound typing stays throttled and audio failures stay optional", async () => {
   const { createSoundPlayer } = extractTestableLogic(readApp(), [
     "createSoundPlayer",
   ]);
   const harness = soundHarness({ times: [100, 110, 130] });
-  const play = createSoundPlayer(harness.now, harness.createContext);
+  const play = createSoundPlayer(
+    harness.now,
+    harness.createContext,
+    null,
+    harness.tapBytes,
+  );
 
   play("typewriter");
   play("typewriter");
@@ -1012,29 +1142,57 @@ test("key sound typing stays throttled and audio failures stay optional", async 
   assert.equal(harness.starts.length, 2);
 
   const rejected = soundHarness({ state: "suspended" });
-  createSoundPlayer(rejected.now, rejected.createContext)("tap", true);
+  createSoundPlayer(
+    rejected.now,
+    rejected.createContext,
+    null,
+    rejected.tapBytes,
+  )("tap", true);
   rejected.rejectResume(new Error("audio resume blocked"));
   await new Promise(setImmediate);
   assert.equal(rejected.starts.length, 0);
 
-  const asynchronousThrow = soundHarness({
-    state: "suspended",
-    throwOnBuffer: true,
-  });
-  createSoundPlayer(asynchronousThrow.now, asynchronousThrow.createContext)(
+  const decodeFailure = soundHarness();
+  createSoundPlayer(
+    decodeFailure.now,
+    decodeFailure.createContext,
+    null,
+    decodeFailure.tapBytes,
+  )("tap", true);
+  decodeFailure.rejectDecode(new Error("audio decode failed"));
+  await new Promise(setImmediate);
+  assert.equal(decodeFailure.starts.length, 0);
+
+  const asynchronousThrow = soundHarness({ throwOnSource: true });
+  createSoundPlayer(
+    asynchronousThrow.now,
+    asynchronousThrow.createContext,
+    null,
+    asynchronousThrow.tapBytes,
+  )(
     "tap",
     true,
   );
-  asynchronousThrow.resolveResume();
+  asynchronousThrow.resolveDecode();
   await new Promise(setImmediate);
   assert.equal(asynchronousThrow.starts.length, 0);
 
   const throwing = soundHarness({ throwOnBuffer: true });
   assert.doesNotThrow(() => {
-    createSoundPlayer(throwing.now, throwing.createContext)("tap", true);
+    createSoundPlayer(
+      throwing.now,
+      throwing.createContext,
+      null,
+      throwing.tapBytes,
+    )("typewriter", true);
   });
   assert.doesNotThrow(() => {
-    createSoundPlayer(() => 100, () => { throw new Error("no audio"); })(
+    createSoundPlayer(
+      () => 100,
+      () => { throw new Error("no audio"); },
+      null,
+      Uint8Array.of(1).buffer,
+    )(
       "tap",
       true,
     );

@@ -413,6 +413,10 @@ select{
 "use strict";
 (function () {
 
+// UI SFX zen/press.mp3 (CC0 1.0), romainsimon/uisfx
+// packages/uisfx/sounds/zen/press.mp3 @ 99d287a1d27ef49c02a5262184a7fda91612321e
+const TAP_AUDIO_BASE64 = "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";
+
 /* ------------------------------------------------------------------ *
  * Storage. Falls back to memory when localStorage is blocked (private
  * mode, sandboxed frame) so the editor never fails to start.
@@ -553,9 +557,19 @@ function resolveSoundPreference(value) {
   return "off";
 }
 
-function createSoundPlayer(now, createContext, getMode = null) {
+function decodeBase64(base64, decode) {
+  const binary = decode(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes.buffer;
+}
+
+function createSoundPlayer(now, createContext, getMode = null, tapBytes = null) {
   const RATE = 44100;
   const buffers = Object.create(null);
+  let tapBufferPromise = null;
   let ctx = null, last = 0, request = 0;
 
   const noise = (i) => {
@@ -580,19 +594,15 @@ function createSoundPlayer(now, createContext, getMode = null) {
     return buffer;
   }
 
-  function buildTap() {
-    const duration = 0.040;
-    const buffer = ctx.createBuffer(1, Math.floor(RATE * duration), RATE);
-    const data = buffer.getChannelData(0);
-    let smooth = 0;
-    for (let i = 0; i < data.length; i += 1) {
-      const t = i / RATE;
-      smooth += (noise(i) - smooth) * 0.18;
-      const attack = Math.min(1, t / 0.002);
-      const decay = Math.exp(-t / 0.010);
-      data[i] = smooth * attack * decay * 0.28;
+  function loadTap() {
+    if (!tapBytes) return Promise.reject(new Error("tap audio unavailable"));
+    if (!tapBufferPromise) {
+      tapBufferPromise = ctx.decodeAudioData(tapBytes.slice(0)).catch((error) => {
+        tapBufferPromise = null;
+        throw error;
+      });
     }
-    return buffer;
+    return tapBufferPromise;
   }
 
   return function play(mode = getMode ? getMode() : "off", preview = false) {
@@ -604,16 +614,21 @@ function createSoundPlayer(now, createContext, getMode = null) {
     try {
       if (!ctx) ctx = createContext();
       const start = () => {
-        if (current !== request || (getMode && getMode() !== mode)) return;
-        if (!buffers[mode]) {
-          buffers[mode] = mode === "tap" ? buildTap() : buildTypewriter();
+        const emit = (buffer, value) => {
+          if (current !== request || (getMode && getMode() !== mode)) return;
+          const src = ctx.createBufferSource();
+          const gain = ctx.createGain();
+          gain.gain.value = value;
+          src.buffer = buffer;
+          src.connect(gain).connect(ctx.destination);
+          src.start();
+        };
+        if (mode === "tap") {
+          void loadTap().then((buffer) => emit(buffer, 0.2)).catch(() => {});
+          return;
         }
-        const src = ctx.createBufferSource();
-        const gain = ctx.createGain();
-        gain.gain.value = mode === "tap" ? 0.12 : 0.16;
-        src.buffer = buffers[mode];
-        src.connect(gain).connect(ctx.destination);
-        src.start();
+        if (!buffers.typewriter) buffers.typewriter = buildTypewriter();
+        emit(buffers.typewriter, 0.16);
       };
       if (ctx.state === "suspended") void ctx.resume().then(start).catch(() => {});
       else start();
@@ -706,13 +721,14 @@ const CMD = MAC ? "\u2318" : "Ctrl ";
 const SHIFT = MAC ? "\u21e7" : "Shift ";
 
 /* ------------------------------------------------------------------ *
- * Key sound. The waveform is the exact synthesis from
- * TypewriterSoundPlayer.swift: shaped noise cushion plus a 235 Hz body.
+ * Key sounds. Typewriter preserves the exact synthesis from
+ * TypewriterSoundPlayer.swift; Soft tap is the embedded UI SFX zen/press MP3.
  * ------------------------------------------------------------------ */
 const sound = createSoundPlayer(
   () => performance.now(),
   () => new (window.AudioContext || window.webkitAudioContext)(),
   () => settings.sound,
+  decodeBase64(TAP_AUDIO_BASE64, atob),
 );
 
 /* ------------------------------------------------------------------ *
@@ -2231,6 +2247,29 @@ Plaintext bundles the following typefaces, each released under the SIL Open Font
 - Work Sans — Copyright 2019 The Work Sans Project Authors.
 
 The complete licence texts are in [ThirdPartyLicenses](ThirdPartyLicenses).
+
+Plaintext also embeds UI SFX `zen/press.mp3` as the Soft tap key sound. The
+asset comes from `romainsimon/uisfx`, path
+`packages/uisfx/sounds/zen/press.mp3`, pinned at commit
+`99d287a1d27ef49c02a5262184a7fda91612321e`. UI SFX audio is dedicated to the
+public domain under CC0 1.0; attribution is appreciated but not required.
+
+UI SFX audio assets are dedicated to the public domain under the Creative
+Commons CC0 1.0 Universal Public Domain Dedication.
+
+To the extent possible under law, Yuki Capital has waived all copyright and
+related or neighboring rights to the procedurally generated audio files in
+`packages/uisfx/sounds`.
+
+You may copy, modify, distribute, and use these files, including for commercial
+purposes, without asking permission. Attribution is appreciated but not
+required.
+
+This dedication does not apply to files under `.generated`, including any
+provider-backed research or evaluation output.
+
+Legal code: https://creativecommons.org/publicdomain/zero/1.0/legalcode
+SPDX identifier: CC0-1.0
 </template>
 </body>
 </html>
