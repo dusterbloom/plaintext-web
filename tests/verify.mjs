@@ -181,6 +181,40 @@ test("recovery write trims history once before giving up", () => {
   assert.deepEqual(failed, { ok: false, history: [1, 2], trimmed: true });
 });
 
+test("paused recovery probes once without trimming history again", () => {
+  const html = readApp();
+  const { writeRecoveryWithFallback } = extractTestableLogic(html, [
+    "writeRecoveryWithFallback",
+  ]);
+  const history = [1, 2];
+  let recoveryWrites = 0;
+  let historyWrites = 0;
+  let historyDeletes = 0;
+  const store = {
+    set(key) {
+      if (key === "r") recoveryWrites += 1;
+      else historyWrites += 1;
+      return false;
+    },
+    del() {
+      historyDeletes += 1;
+    },
+  };
+
+  const result = writeRecoveryWithFallback(
+    store,
+    { recovery: "r", history: "h" },
+    "current",
+    history,
+    true,
+  );
+
+  assert.deepEqual(result, { ok: false, history, trimmed: false });
+  assert.equal(recoveryWrites, 1);
+  assert.equal(historyWrites, 0);
+  assert.equal(historyDeletes, 0);
+});
+
 test("file writer closes only after writing exact text", async () => {
   const html = readApp();
   const { writeToHandle } = extractTestableLogic(html, ["writeToHandle"]);
@@ -201,6 +235,110 @@ test("file writer closes only after writing exact text", async () => {
 
   await writeToHandle(handle, "current");
   assert.deepEqual(calls, ["create", ["write", "current"], "close"]);
+});
+
+test("document write marks only the captured snapshot clean", async () => {
+  const html = readApp();
+  const { writeDocumentSnapshot } = extractTestableLogic(html, [
+    "writeDocumentSnapshot",
+  ]);
+  let releaseClose;
+  let signalWrite;
+  const closeGate = new Promise((resolve) => {
+    releaseClose = resolve;
+  });
+  const writeStarted = new Promise((resolve) => {
+    signalWrite = resolve;
+  });
+  let writtenText = null;
+  const handle = {
+    async createWritable() {
+      return {
+        async write(text) {
+          writtenText = text;
+          signalWrite();
+        },
+        async close() {
+          await closeGate;
+        },
+      };
+    },
+  };
+  const documentState = {
+    text: "written snapshot",
+    cleanText: null,
+  };
+
+  const saving = writeDocumentSnapshot(handle, documentState);
+  await writeStarted;
+  documentState.text = "typed while saving";
+  releaseClose();
+  await saving;
+
+  assert.equal(writtenText, "written snapshot");
+  assert.equal(documentState.cleanText, "written snapshot");
+  assert.equal(documentState.text, "typed while saving");
+});
+
+test("failed download click revokes its object URL immediately", () => {
+  const html = readApp();
+  const { initiateDownload } = extractTestableLogic(html, [
+    "initiateDownload",
+  ]);
+  let revocations = 0;
+  let schedules = 0;
+  const failure = new Error("download blocked");
+  const documentState = { text: "exported", cleanText: null };
+
+  assert.throws(
+    () =>
+      initiateDownload(
+        {
+          click() {
+            throw failure;
+          },
+        },
+        () => {
+          revocations += 1;
+        },
+        () => {
+          schedules += 1;
+        },
+        documentState,
+        "exported",
+      ),
+    failure,
+  );
+  assert.equal(revocations, 1);
+  assert.equal(schedules, 0);
+  assert.equal(documentState.cleanText, null);
+});
+
+test("download marks only the captured export snapshot clean", () => {
+  const html = readApp();
+  const { initiateDownload } = extractTestableLogic(html, [
+    "initiateDownload",
+  ]);
+  const documentState = {
+    text: "exported snapshot",
+    cleanText: null,
+  };
+  const exportedText = documentState.text;
+
+  initiateDownload(
+    {
+      click() {
+        documentState.text = "changed during click";
+      },
+    },
+    () => {},
+    () => {},
+    documentState,
+    exportedText,
+  );
+
+  assert.equal(documentState.cleanText, "exported snapshot");
+  assert.equal(documentState.text, "changed during click");
 });
 
 test("abort detection recognizes only browser cancellation errors", () => {

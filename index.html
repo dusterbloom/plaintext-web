@@ -388,9 +388,19 @@ function documentIsDirty(text, cleanText) {
   return text !== cleanText;
 }
 
-function writeRecoveryWithFallback(storage, keys, text, history) {
+function writeRecoveryWithFallback(
+  storage,
+  keys,
+  text,
+  history,
+  historyPaused = false,
+) {
   if (storage.set(keys.recovery, text)) {
     return { ok: true, history, trimmed: false };
+  }
+
+  if (historyPaused) {
+    return { ok: false, history, trimmed: false };
   }
 
   const keepCount = Math.ceil(history.length / 2);
@@ -410,6 +420,27 @@ async function writeToHandle(handle, text) {
   const writable = await handle.createWritable();
   await writable.write(text);
   await writable.close();
+}
+
+function markClean(documentState, text) {
+  documentState.cleanText = text;
+}
+
+async function writeDocumentSnapshot(handle, documentState) {
+  const text = documentState.text;
+  await writeToHandle(handle, text);
+  markClean(documentState, text);
+}
+
+function initiateDownload(link, revoke, schedule, documentState, text) {
+  try {
+    link.click();
+  } catch (error) {
+    revoke();
+    throw error;
+  }
+  markClean(documentState, text);
+  schedule(revoke, 1000);
 }
 
 function isAbort(error) {
@@ -634,11 +665,6 @@ function isDirty() {
   return documentIsDirty(doc.text, doc.cleanText);
 }
 
-function markClean() {
-  doc.cleanText = doc.text;
-  renderTitle();
-}
-
 /* ---------- edits, undo, autosave ---------- */
 function setText(value, opts) {
   if (value === doc.text) return;
@@ -709,6 +735,7 @@ function persistNow() {
     K,
     doc.text,
     doc.history,
+    persistence.historyPaused,
   );
   doc.history = recovery.history;
   setPersistenceHealth(recovery.ok, recovery.trimmed);
@@ -853,8 +880,8 @@ async function openDocument() {
 async function save() {
   if (!doc.handle) return saveAs();
   try {
-    await writeToHandle(doc.handle, doc.text);
-    markClean();
+    await writeDocumentSnapshot(doc.handle, doc);
+    renderTitle();
     persistNow();
     editor.focus();
   } catch (error) {
@@ -877,10 +904,9 @@ async function saveAs() {
       suggestedName: suggested,
       types: FILE_TYPES,
     });
-    await writeToHandle(handle, doc.text);
+    await writeDocumentSnapshot(handle, doc);
     doc.handle = handle;
     doc.name = handle.name || suggested;
-    markClean();
     renderTitle();
     persistNow();
     editor.focus();
@@ -890,13 +916,13 @@ async function saveAs() {
 }
 
 function downloadCopy(suggested) {
-  const url = URL.createObjectURL(new Blob([doc.text], { type: "text/markdown;charset=utf-8" }));
+  const text = doc.text;
+  const url = URL.createObjectURL(new Blob([text], { type: "text/markdown;charset=utf-8" }));
   const link = document.createElement("a");
   link.href = url;
   link.download = suggested;
-  link.click();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
-  markClean();
+  initiateDownload(link, () => URL.revokeObjectURL(url), setTimeout, doc, text);
+  renderTitle();
   persistNow();
   editor.focus();
 }
