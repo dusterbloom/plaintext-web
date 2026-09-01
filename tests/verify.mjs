@@ -52,6 +52,10 @@ function legalBlock(html) {
   return match[1];
 }
 
+function normalizeNotice(source) {
+  return source.replace(/[ \t]+$/gm, "").replace(/\r\n/g, "\n").replace(/\n+$/, "");
+}
+
 test("release is one parseable offline HTML file", () => {
   const html = readApp();
   const runtime = runtimeSource(html);
@@ -83,7 +87,7 @@ test("repository and standalone app retain required legal notices", () => {
   for (const relative of legalFiles) {
     const path = resolve(root, relative);
     assert.ok(existsSync(path), relative + " is missing");
-    const notice = readFileSync(path, "utf8").trim();
+    const notice = normalizeNotice(readFileSync(path, "utf8"));
     assert.ok(notice.length > 100, relative + " is unexpectedly short");
     assert.ok(
       embedded.includes(notice),
