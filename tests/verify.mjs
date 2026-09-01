@@ -66,6 +66,7 @@ function writingSessionHarness(saved, { progress, now }) {
     clock: { hidden: true, textContent: "" },
     ghost: { hidden: false },
     pace: { hidden: true },
+    sessionStatus: { textContent: "" },
   };
   const session = {
     active: false,
@@ -749,6 +750,85 @@ test("short landscape editor padding does not repeat the safe-area inset", () =>
   assert.ok(landscape, "short-landscape media query missing");
   assert.match(landscape[1], /padding-bottom:2\.5rem/);
   assert.doesNotMatch(landscape[1], /safe-bottom/);
+});
+
+test("dialogs, palette, title, and live output have accessible semantics", () => {
+  const html = readApp();
+  const dialogs = {
+    settings: "settingsTitle",
+    history: "historyTitle",
+    alert: "alertTitle",
+    sessionDlg: "sessionTitle",
+    palette: "paletteTitle",
+    discardDialog: "discardTitle",
+  };
+  for (const [id, label] of Object.entries(dialogs)) {
+    assert.match(
+      html,
+      new RegExp(
+        '<dialog(?=[^>]*\\bid="' + id +
+        '")(?=[^>]*\\baria-labelledby="' + label + '")[^>]*>',
+      ),
+      id + " dialog needs the expected aria-labelledby",
+    );
+    assert.match(html, new RegExp('id="' + label + '"'));
+  }
+  assert.match(html, /id="title"[^>]*aria-label="Open command palette"/);
+  assert.match(html, /id="paletteQuery"[^>]*role="combobox"/);
+  assert.match(html, /id="paletteList"[^>]*role="listbox"/);
+  assert.match(
+    html,
+    /role="option"|setAttribute\(["']role["'],\s*["']option["']\)/,
+  );
+  assert.match(html, /id="sessionStatus"[^>]*role="status"/);
+  assert.match(html, /<link rel="icon" href="data:,"/);
+});
+
+test("keyboard handling preserves browser and focus conventions", () => {
+  const html = readApp();
+  const script = extractInlineScript(html);
+  assert.doesNotMatch(
+    script,
+    /\.key\s*!==\s*["']Tab["'][\s\S]{0,200}preventDefault/,
+  );
+  assert.doesNotMatch(
+    script,
+    /key\s*===\s*["']d["'][\s\S]{0,100}toggleDark/,
+  );
+  assert.doesNotMatch(
+    script,
+    /key\s*===\s*["']k["'][\s\S]{0,100}openPalette/,
+  );
+  assert.match(script, /addListener/);
+  assert.match(script, /closest\(\s*["']input, select, textarea, button/);
+});
+
+test("selection, announcements, and motion wiring stay scoped", () => {
+  const html = readApp();
+  const script = extractInlineScript(html);
+  const settingsSource = extractFunctionSource(html, "buildSettings");
+  const sessionSource = extractFunctionSource(html, "finishSession");
+
+  assert.match(
+    html,
+    /\.palette \[role="option"\]\[aria-selected="true"\]/,
+  );
+  assert.doesNotMatch(html, /\.palette li\[aria-selected="true"\]/);
+  assert.match(script, /function syncPaletteSelection\(/);
+  assert.match(script, /removeAttribute\(["']aria-activedescendant["']\)/);
+  assert.match(script, /setAttribute\(["']aria-expanded["'],\s*["']true["']\)/);
+  assert.match(script, /setAttribute\(["']aria-expanded["'],\s*["']false["']\)/);
+  assert.doesNotMatch(
+    settingsSource,
+    /addEventListener\(["']click["'][\s\S]*buildSettings\(\)/,
+  );
+  assert.match(script, /\$\(["']themes["']\)\.addEventListener\(["']keydown["']/);
+  assert.match(sessionSource, /\$\(["']sessionStatus["']\)\.textContent/);
+  assert.match(html, /\.sr-only\s*\{[\s\S]*clip-path:\s*inset\(50%\)/);
+  assert.match(
+    html,
+    /@media \(prefers-reduced-motion:\s*reduce\)[\s\S]*\*::before[\s\S]*animation-iteration-count:\s*1\s*!important/,
+  );
 });
 
 export {
