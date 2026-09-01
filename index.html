@@ -456,6 +456,23 @@ function parseBoundedInteger(value, maximum) {
   if (number < 1 || number > maximum) return null;
   return number;
 }
+
+function sessionCompletionReason(progress, goal, now, endsAt) {
+  if (progress >= goal) return "goal";
+  if (now >= endsAt) return "time";
+  return null;
+}
+
+function isValidFinishedSession(finished, goal, minutes) {
+  if (finished == null) return true;
+  if (finished.reason !== "goal" && finished.reason !== "time") return false;
+  if (!Number.isSafeInteger(finished.count) || finished.count < 0) return false;
+  if (!Number.isSafeInteger(finished.elapsed) || finished.elapsed < 0) return false;
+  if (finished.elapsed > minutes * 60000) return false;
+  return finished.reason === "goal"
+    ? finished.count >= goal
+    : finished.count < goal;
+}
 /* @testable:end */
 
 /* ------------------------------------------------------------------ *
@@ -1450,7 +1467,10 @@ function finishSession(reason) {
   if (session.finished) return;
   session.finished = {
     reason: reason,
-    elapsed: Math.min(session.minutes * 60000, Date.now() - session.startedAt),
+    elapsed: Math.min(
+      session.minutes * 60000,
+      Math.max(0, Date.now() - session.startedAt),
+    ),
     count: sessionProgress()
   };
   clearInterval(session.timer);
@@ -1485,6 +1505,24 @@ function startSession(goal, unit, minutes, restored) {
     session.baseline = unit === "words" ? wordsIn(doc.text) : doc.text.length;
     session.startedAt = Date.now();
     session.endsAt = session.startedAt + minutes * 60000;
+  }
+  const completionReason = session.finished
+    ? null
+    : sessionCompletionReason(
+        sessionProgress(),
+        session.goal,
+        Date.now(),
+        session.endsAt,
+      );
+  if (completionReason) {
+    session.windowBaseline = sessionProgress();
+    session.bars = [];
+    session.cum = [];
+    session.spent = 0;
+    $("clock").hidden = false;
+    $("pace").hidden = false;
+    finishSession(completionReason);
+    return;
   }
   persistSession();
   buildBars();
@@ -1533,17 +1571,12 @@ function restoreSession() {
     saved &&
     Number.isInteger(saved.baseline) &&
     saved.baseline >= 0 &&
-    Number.isFinite(saved.startedAt) &&
+    Number.isSafeInteger(saved.startedAt) &&
     saved.startedAt > 0 &&
-    Number.isFinite(saved.endsAt) &&
+    Number.isSafeInteger(saved.endsAt) &&
     saved.endsAt >= saved.startedAt;
   const finishedIsValid =
-    saved &&
-    (saved.finished == null ||
-      ((saved.finished.reason === "goal" ||
-        saved.finished.reason === "time") &&
-        Number.isFinite(saved.finished.count) &&
-        Number.isFinite(saved.finished.elapsed)));
+    saved && isValidFinishedSession(saved.finished, goal, minutes);
 
   if (
     !goal ||

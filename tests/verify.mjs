@@ -35,6 +35,122 @@ function extractTestableLogic(html, names) {
   )();
 }
 
+function extractFunctionSource(html, name) {
+  const script = extractInlineScript(html);
+  const start = script.indexOf("function " + name + "(");
+  assert.notEqual(start, -1, name + " function missing");
+  const body = script.indexOf("{", start);
+  let depth = 0;
+  for (let index = body; index < script.length; index += 1) {
+    if (script[index] === "{") depth += 1;
+    if (script[index] === "}") depth -= 1;
+    if (depth === 0) return script.slice(start, index + 1);
+  }
+  assert.fail(name + " function is not balanced");
+}
+
+function writingSessionHarness(saved, { progress, now }) {
+  const html = readApp();
+  const {
+    isValidFinishedSession,
+    parseBoundedInteger,
+    sessionCompletionReason,
+  } = extractTestableLogic(html, [
+    "isValidFinishedSession",
+    "parseBoundedInteger",
+    "sessionCompletionReason",
+  ]);
+  const calls = [];
+  const persisted = [];
+  const nodes = {
+    clock: { hidden: true, textContent: "" },
+    ghost: { hidden: false },
+    pace: { hidden: true },
+  };
+  const session = {
+    active: false,
+    finished: null,
+    goal: 10,
+    unit: "words",
+    minutes: 1,
+    baseline: 0,
+    windowBaseline: 0,
+    startedAt: 0,
+    endsAt: 0,
+    bars: [],
+    cum: [],
+    spent: 0,
+    timer: 0,
+    frame: 0,
+  };
+  const store = {
+    get() {
+      return JSON.stringify(saved);
+    },
+    set(key, value) {
+      calls.push("set");
+      persisted.push({ key, value: JSON.parse(value) });
+      return true;
+    },
+    del() {
+      calls.push("delete");
+    },
+  };
+  const context = {
+    $: (id) => nodes[id],
+    Date: { now: () => now },
+    K: { session: "session" },
+    buildBars: () => calls.push("build"),
+    cancelAnimationFrame() {},
+    clearInterval() {},
+    doc: { text: "" },
+    formatLeft: String,
+    isValidFinishedSession,
+    paintBars: () =>
+      calls.push("paint:" + (session.finished ? session.finished.reason : "active")),
+    parseBoundedInteger,
+    renderCount: () => calls.push("render"),
+    session,
+    sessionCompletionReason,
+    sessionProgress: () => progress,
+    setInterval() {
+      calls.push("timer");
+      return 1;
+    },
+    store,
+    tickClock: () => calls.push("tick"),
+    updatePace: () => calls.push("pace"),
+    wordsIn: () => 0,
+  };
+  const source = [
+    "finishSession",
+    "persistSession",
+    "startSession",
+    "restoreSession",
+  ]
+    .map((name) => extractFunctionSource(html, name))
+    .join("\n");
+  const runtime = new Function(
+    ...Object.keys(context),
+    source + "; return { restoreSession };",
+  )(...Object.values(context));
+
+  return { ...runtime, calls, nodes, persisted, session };
+}
+
+function savedSession(overrides = {}) {
+  return {
+    goal: 10,
+    unit: "words",
+    minutes: 1,
+    baseline: 0,
+    startedAt: 1,
+    endsAt: 100,
+    finished: null,
+    ...overrides,
+  };
+}
+
 const legalFiles = [
   "LICENSE",
   "THIRD_PARTY_NOTICES.md",
@@ -371,6 +487,188 @@ test("session numbers are finite bounded positive integers", () => {
   assert.equal(parseBoundedInteger("1.5", 10), null);
   assert.equal(parseBoundedInteger("1e309", 10), null);
   assert.equal(parseBoundedInteger("11", 10), null);
+});
+
+test("session completion gives the goal precedence over the deadline", () => {
+  const html = readApp();
+  const { sessionCompletionReason } = extractTestableLogic(html, [
+    "sessionCompletionReason",
+  ]);
+
+  assert.equal(sessionCompletionReason(9, 10, 99, 100), null);
+  assert.equal(sessionCompletionReason(9, 10, 100, 100), "time");
+  assert.equal(sessionCompletionReason(10, 10, 99, 100), "goal");
+  assert.equal(sessionCompletionReason(10, 10, 100, 100), "goal");
+});
+
+test("finished session records are safe, bounded, and reason-consistent", () => {
+  const html = readApp();
+  const { isValidFinishedSession } = extractTestableLogic(html, [
+    "isValidFinishedSession",
+  ]);
+  const validGoal = { reason: "goal", count: 10, elapsed: 60_000 };
+  const validTime = { reason: "time", count: 9, elapsed: 60_000 };
+
+  assert.equal(isValidFinishedSession(null, 10, 1), true);
+  assert.equal(isValidFinishedSession(validGoal, 10, 1), true);
+  assert.equal(isValidFinishedSession(validTime, 10, 1), true);
+  assert.equal(
+    isValidFinishedSession({ ...validTime, count: -1 }, 10, 1),
+    false,
+  );
+  assert.equal(
+    isValidFinishedSession({ ...validGoal, count: 10.5 }, 10, 1),
+    false,
+  );
+  assert.equal(
+    isValidFinishedSession(
+      { ...validGoal, count: Number.MAX_SAFE_INTEGER + 1 },
+      10,
+      1,
+    ),
+    false,
+  );
+  assert.equal(
+    isValidFinishedSession({ ...validGoal, elapsed: -1 }, 10, 1),
+    false,
+  );
+  assert.equal(
+    isValidFinishedSession({ ...validGoal, elapsed: 1.5 }, 10, 1),
+    false,
+  );
+  assert.equal(
+    isValidFinishedSession(
+      { ...validGoal, elapsed: Number.MAX_SAFE_INTEGER + 1 },
+      10,
+      1,
+    ),
+    false,
+  );
+  assert.equal(
+    isValidFinishedSession({ ...validGoal, elapsed: 60_001 }, 10, 1),
+    false,
+  );
+  assert.equal(
+    isValidFinishedSession({ ...validGoal, count: 9 }, 10, 1),
+    false,
+  );
+  assert.equal(
+    isValidFinishedSession({ ...validTime, count: 10 }, 10, 1),
+    false,
+  );
+});
+
+test("restored unfinished sessions decide before rendering or timing", () => {
+  const active = writingSessionHarness(savedSession(), {
+    progress: 9,
+    now: 99,
+  });
+  active.restoreSession();
+  assert.equal(active.session.finished, null);
+  assert.equal(active.calls.includes("build"), true);
+  assert.equal(active.calls.includes("timer"), true);
+  assert.equal(active.calls.includes("tick"), true);
+
+  const expired = writingSessionHarness(savedSession(), {
+    progress: 9,
+    now: 100,
+  });
+  expired.restoreSession();
+  assert.equal(expired.session.finished.reason, "time");
+  assert.equal(expired.calls.includes("build"), false);
+  assert.equal(expired.calls.includes("timer"), false);
+  assert.equal(expired.calls.includes("paint:time"), true);
+  assert.equal(expired.calls.includes("paint:active"), false);
+  assert.equal(expired.nodes.ghost.hidden, true);
+  assert.equal(expired.persisted.at(-1).value.finished.reason, "time");
+
+  const goalMet = writingSessionHarness(savedSession(), {
+    progress: 10,
+    now: 99,
+  });
+  goalMet.restoreSession();
+  assert.equal(goalMet.session.finished.reason, "goal");
+  assert.equal(goalMet.calls.includes("build"), false);
+  assert.equal(goalMet.calls.includes("timer"), false);
+  assert.equal(goalMet.calls.includes("paint:goal"), true);
+  assert.equal(goalMet.calls.includes("paint:active"), false);
+  assert.equal(goalMet.persisted.at(-1).value.finished.reason, "goal");
+
+  const bothMet = writingSessionHarness(savedSession(), {
+    progress: 10,
+    now: 100,
+  });
+  bothMet.restoreSession();
+  assert.equal(bothMet.session.finished.reason, "goal");
+  assert.equal(bothMet.calls.includes("build"), false);
+  assert.equal(bothMet.calls.includes("timer"), false);
+  assert.equal(bothMet.calls.includes("paint:goal"), true);
+  assert.equal(bothMet.calls.includes("paint:active"), false);
+  assert.equal(bothMet.persisted.at(-1).value.finished.reason, "goal");
+});
+
+test("restored timestamps cannot create invalid finished records", () => {
+  const fractional = writingSessionHarness(
+    savedSession({ startedAt: 1.5 }),
+    { progress: 10, now: 99 },
+  );
+  fractional.restoreSession();
+  assert.deepEqual(fractional.calls, ["delete"]);
+  assert.equal(fractional.persisted.length, 0);
+
+  const future = writingSessionHarness(
+    savedSession({ startedAt: 200, endsAt: 300 }),
+    { progress: 10, now: 100 },
+  );
+  future.restoreSession();
+  assert.equal(future.session.finished.reason, "goal");
+  assert.equal(future.session.finished.elapsed, 0);
+  assert.equal(future.persisted.at(-1).value.finished.elapsed, 0);
+});
+
+test("valid finished restores retain their terminal state", () => {
+  for (const finished of [
+    { reason: "goal", count: 10, elapsed: 50 },
+    { reason: "time", count: 9, elapsed: 60 },
+  ]) {
+    const restored = writingSessionHarness(savedSession({ finished }), {
+      progress: 0,
+      now: 200,
+    });
+    restored.restoreSession();
+    assert.deepEqual(restored.session.finished, finished);
+    assert.equal(restored.calls.includes("delete"), false);
+    assert.equal(restored.calls.includes("timer"), false);
+    assert.equal(restored.nodes.ghost.hidden, true);
+    assert.deepEqual(restored.persisted.at(-1).value.finished, finished);
+  }
+});
+
+test("invalid finished restores are deleted without starting", () => {
+  const validGoal = { reason: "goal", count: 10, elapsed: 60_000 };
+  const validTime = { reason: "time", count: 9, elapsed: 60_000 };
+  const invalidRecords = [
+    { ...validTime, count: -1 },
+    { ...validGoal, count: 10.5 },
+    { ...validGoal, count: Number.MAX_SAFE_INTEGER + 1 },
+    { ...validGoal, elapsed: -1 },
+    { ...validGoal, elapsed: 1.5 },
+    { ...validGoal, elapsed: Number.MAX_SAFE_INTEGER + 1 },
+    { ...validGoal, elapsed: 60_001 },
+    { ...validGoal, count: 9 },
+    { ...validTime, count: 10 },
+  ];
+
+  for (const finished of invalidRecords) {
+    const rejected = writingSessionHarness(savedSession({ finished }), {
+      progress: 0,
+      now: 99,
+    });
+    rejected.restoreSession();
+    assert.deepEqual(rejected.calls, ["delete"]);
+    assert.equal(rejected.session.active, false);
+    assert.equal(rejected.persisted.length, 0);
+  }
 });
 
 test("session form exposes limits, errors, and a rolling window", () => {
