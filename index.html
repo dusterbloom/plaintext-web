@@ -286,6 +286,7 @@ select{
     Untitled
   </button>
   <div id="persistenceStatus" class="persistence-status" role="status" aria-live="polite" hidden></div>
+  <button class="btn" id="connectWorkspace" type="button">Connect workspace</button>
   <div class="wrap">
     <div class="stack">
       <div id="ghost" aria-hidden="true" hidden><span id="ghostText"></span><span id="ghostFill"></span></div>
@@ -449,7 +450,8 @@ const K = {
   count: "plaintext.showsWordCount", recovery: "plaintext.recovery",
   name: "plaintext.documentName", history: "plaintext.history", clean: "plaintext.clean",
   match: "plaintext.matchSystem", light: "plaintext.lightTheme",
-  dark: "plaintext.darkTheme", session: "plaintext.session"
+  dark: "plaintext.darkTheme", session: "plaintext.session",
+  durable: "plaintext.durableRevision"
 };
 
 /* @testable:start */
@@ -465,6 +467,59 @@ function fingerprint(text) {
 function documentIsDirty(text, cleanText) {
   if (cleanText === null) return text.length > 0;
   return text !== cleanText;
+}
+
+async function digestText(text, subtle) {
+  const bytes = await subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(bytes), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function makeDocumentRevision(text, name, savedAt, revision, digest, parentDigest = null) {
+  if (typeof text !== "string" || typeof name !== "string" || !Number.isSafeInteger(savedAt)
+    || !Number.isSafeInteger(revision) || revision < 1 || !/^[a-f0-9]{64}$/u.test(digest)) {
+    throw new TypeError("invalid document revision");
+  }
+  return { format: "plaintext-web", version: 1, name, savedAt, revision, parentDigest, digest, text };
+}
+
+function validateDocumentRevision(value) {
+  const fields = ["format", "version", "name", "savedAt", "revision", "parentDigest", "digest", "text"];
+  return Boolean(value && typeof value === "object" && !Array.isArray(value)
+    && !Object.keys(value).some((key) => !fields.includes(key))
+    && value.format === "plaintext-web" && value.version === 1
+    && typeof value.name === "string" && typeof value.text === "string"
+    && Number.isSafeInteger(value.savedAt) && value.savedAt >= 0
+    && Number.isSafeInteger(value.revision) && value.revision > 0
+    && (value.parentDigest === null || /^[a-f0-9]{64}$/u.test(value.parentDigest))
+    && /^[a-f0-9]{64}$/u.test(value.digest));
+}
+
+function compareDocumentRevisions(disk, cache) {
+  if (!disk) return cache ? "cache" : "same";
+  if (!cache) return "disk";
+  if (disk.digest === cache.digest) return "same";
+  if (cache.parentDigest === disk.digest && cache.revision > disk.revision) return "cache";
+  if (disk.parentDigest === cache.digest && disk.revision > cache.revision) return "disk";
+  return "conflict";
+}
+
+async function writeVerifiedFile(handle, text) {
+  const writable = await handle.createWritable();
+  await writable.write(text);
+  await writable.close();
+  const actual = await (await handle.getFile()).text();
+  if (actual !== text) throw new Error("disk write verification failed");
+}
+
+async function createPlaintextWorkspace(directory) {
+  const root = await directory.getDirectoryHandle("Plaintext", { create: true });
+  const recovery = await root.getDirectoryHandle("recovery", { create: true });
+  const snapshots = await recovery.getDirectoryHandle("snapshots", { create: true });
+  return {
+    document: await root.getFileHandle("document.md", { create: true }),
+    latest: await recovery.getFileHandle("latest.json", { create: true }),
+    snapshots,
+  };
 }
 
 function writeRecoveryWithFallback(
@@ -496,9 +551,7 @@ function writeRecoveryWithFallback(
 }
 
 async function writeToHandle(handle, text) {
-  const writable = await handle.createWritable();
-  await writable.write(text);
-  await writable.close();
+  await writeVerifiedFile(handle, text);
 }
 
 function markClean(documentState, text) {
@@ -802,6 +855,76 @@ const persistence = {
   healthy: store.live(),
   historyPaused: !store.live(),
 };
+let durableState = { kind: "disconnected", workspace: null, revision: 0, digest: null, queue: Promise.resolve() };
+
+async function writeDurableDocument(text, name) {
+  if (durableState.kind !== "connected") throw new Error("workspace disconnected");
+  const digest = await digestText(text, crypto.subtle);
+  const revision = durableState.revision + 1;
+  const record = makeDocumentRevision(text, name, Date.now(), revision, digest, durableState.digest);
+  const metadata = JSON.stringify(record, null, 2) + "\n";
+  renderPersistenceStatus("Saving to disk…");
+  const snapshot = await durableState.workspace.snapshots.getFileHandle(String(record.savedAt) + "-r" + revision + ".json", { create: true });
+  await writeVerifiedFile(snapshot, metadata);
+  await writeVerifiedFile(durableState.workspace.document, text);
+  await writeVerifiedFile(durableState.workspace.latest, metadata);
+  durableState.revision = revision;
+  durableState.digest = digest;
+  renderPersistenceStatus("Saved to disk");
+  return record;
+}
+
+function enqueueDurableDocument() {
+  const text = doc.text;
+  const name = doc.name;
+  durableState.queue = durableState.queue.then(() => writeDurableDocument(text, name));
+  durableState.queue.catch(() => {
+    durableState.kind = "disconnected";
+    editor.disabled = true;
+    renderPersistenceStatus("Backup disconnected—reconnect to edit.");
+  });
+  return durableState.queue;
+}
+
+async function connectWorkspace() {
+  if (!window.showDirectoryPicker) {
+    renderPersistenceStatus("This browser cannot verify disk backups. Plaintext is read-only.");
+    return false;
+  }
+  try {
+    renderPersistenceStatus("Connecting…");
+    const workspace = await createPlaintextWorkspace(await window.showDirectoryPicker({ mode: "readwrite" }));
+    let disk = null;
+    const raw = await (await workspace.latest.getFile()).text();
+    if (raw.trim()) {
+      disk = JSON.parse(raw);
+      if (!validateDocumentRevision(disk)) throw new Error("invalid Plaintext recovery metadata");
+      if (await digestText(disk.text, crypto.subtle) !== disk.digest) throw new Error("Plaintext recovery integrity check failed");
+    }
+    const cacheRaw = store.get(K.durable);
+    let cache = null;
+    try { cache = cacheRaw ? JSON.parse(cacheRaw) : null; } catch (_) {}
+    const choice = compareDocumentRevisions(disk, cache);
+    if (disk && (choice === "disk" || (choice === "conflict" && confirm("Disk and browser copies differ. OK restores disk; Cancel preserves browser text.")))) {
+      doc.text = disk.text;
+      doc.name = disk.name;
+      replaceEditorText(doc.text);
+      renderTitle();
+    }
+    durableState = { kind: "connected", workspace, revision: disk?.revision || 0,
+      digest: disk?.digest || null, queue: Promise.resolve() };
+    editor.disabled = false;
+    await enqueueDurableDocument();
+    $("connectWorkspace").textContent = "Workspace connected";
+    editor.focus();
+    return true;
+  } catch (error) {
+    durableState.kind = "disconnected";
+    editor.disabled = true;
+    if (!isAbort(error)) renderPersistenceStatus("Backup disconnected—Plaintext is read-only.");
+    return false;
+  }
+}
 
 /* ---------- rendering ---------- */
 function applyTheme() {
@@ -956,6 +1079,11 @@ function persistNow() {
     snapshotIfNeeded();
     trimHistory();
     writeHistory();
+  }
+  if (durableState.kind === "connected") {
+    void enqueueDurableDocument().then((record) => {
+      store.set(K.durable, JSON.stringify(record));
+    });
   }
 }
 
@@ -1450,6 +1578,9 @@ function toggleFullscreen() {
 /* ------------------------------------------------------------------ *
  * Input wiring
  * ------------------------------------------------------------------ */
+editor.disabled = true;
+$("connectWorkspace").addEventListener("click", () => { void connectWorkspace(); });
+if (!window.showDirectoryPicker) renderPersistenceStatus("This browser cannot verify disk backups. Plaintext is read-only.");
 editor.addEventListener("input", () => setText(editor.value, { fromEditor: true }));
 
 editor.addEventListener("keydown", (e) => {

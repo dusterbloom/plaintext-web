@@ -6,6 +6,15 @@ JP Aumasson's [Plaintext](https://github.com/veorq/Plaintext).
 It is a quiet plain-text editor delivered as one self-contained HTML file.
 Your document stays in your browser unless you explicitly open or save a file.
 
+## Durable workspace
+
+Plaintext is read-only until **Connect workspace** succeeds. Choose a folder
+you control; Plaintext creates `Plaintext/document.md`, recovery metadata at
+`Plaintext/recovery/latest.json`, and immutable snapshots under
+`Plaintext/recovery/snapshots/`. Writes are serialized, closed, and read back
+before **Saved to disk** appears. Browser storage is only a recovery cache. A
+permission or verification failure locks editing until reconnection.
+
 ## Try it
 
 Open the [live demo](https://dusterbloom.github.io/plaintext-web/), or download

@@ -36,6 +36,30 @@ function extractTestableLogic(html, names) {
   )();
 }
 
+test("durable document revisions detect equality and divergence", async () => {
+  const api = extractTestableLogic(readApp(), ["digestText", "makeDocumentRevision", "validateDocumentRevision", "compareDocumentRevisions"]);
+  const digest = await api.digestText("hello", crypto.subtle);
+  const first = api.makeDocumentRevision("hello", "note.md", 10, 1, digest, null);
+  assert.equal(api.validateDocumentRevision(first), true);
+  assert.equal(api.compareDocumentRevisions(first, { ...first }), "same");
+  assert.equal(api.compareDocumentRevisions(first, { ...first, revision: 2, parentDigest: digest, digest: "next" }), "cache");
+  assert.equal(api.compareDocumentRevisions(first, { ...first, digest: "other" }), "conflict");
+});
+
+test("verified file writes close before read-back", async () => {
+  const { writeVerifiedFile } = extractTestableLogic(readApp(), ["writeVerifiedFile"]);
+  let stored = "";
+  const events = [];
+  const handle = {
+    async createWritable() { return { async write(value) { events.push("write"); stored = value; }, async close() { events.push("close"); } }; },
+    async getFile() { events.push("read"); return { async text() { return stored; } }; },
+  };
+  await writeVerifiedFile(handle, "safe");
+  assert.deepEqual(events, ["write", "close", "read"]);
+  handle.getFile = async () => ({ async text() { return "wrong"; } });
+  await assert.rejects(writeVerifiedFile(handle, "safe"), /verification/);
+});
+
 function extractFunctionSource(html, name) {
   const script = extractInlineScript(html);
   const start = script.indexOf("function " + name + "(");
@@ -355,10 +379,14 @@ test("file writer closes only after writing exact text", async () => {
         },
       };
     },
+    async getFile() {
+      calls.push("read");
+      return { async text() { return "current"; } };
+    },
   };
 
   await writeToHandle(handle, "current");
-  assert.deepEqual(calls, ["create", ["write", "current"], "close"]);
+  assert.deepEqual(calls, ["create", ["write", "current"], "close", "read"]);
 });
 
 test("document write marks only the captured snapshot clean", async () => {
@@ -387,6 +415,7 @@ test("document write marks only the captured snapshot clean", async () => {
         },
       };
     },
+    async getFile() { return { async text() { return writtenText; } }; },
   };
   const documentState = {
     text: "written snapshot",
