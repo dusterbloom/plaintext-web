@@ -3,8 +3,9 @@
 Plaintext Web is an unofficial, dependency-free web adaptation inspired by
 JP Aumasson's [Plaintext](https://github.com/veorq/Plaintext).
 
-It is a quiet plain-text editor delivered as one self-contained HTML file.
-Your document stays in your browser unless you explicitly open or save a file.
+It is a quiet plain-text editor delivered as one self-contained HTML file. Its
+durable state lives in a folder you explicitly select; browser storage is only
+a recovery cache.
 
 ## Durable workspace
 
@@ -14,6 +15,19 @@ you control; Plaintext creates `Plaintext/document.md`, recovery metadata at
 `Plaintext/recovery/snapshots/`. Writes are serialized, closed, and read back
 before **Saved to disk** appears. Browser storage is only a recovery cache. A
 permission or verification failure locks editing until reconnection.
+
+On each launch:
+
+1. Select **Connect workspace**.
+2. Choose the parent folder that should contain Plaintext's durable data.
+3. Resolve any disk/browser divergence when prompted.
+4. Do not close the page while the status says **Saving to disk…**.
+
+Plaintext preserves the existing disk revision before reconciliation and never
+automatically deletes snapshots. Copy the whole `Plaintext` directory to
+restore or migrate a document. `document.md` is the current readable document;
+`recovery/latest.json` and `recovery/snapshots/` retain revision metadata and
+complete recovery states.
 
 ## Try it
 
@@ -28,7 +42,7 @@ requests.
 
 ## Features
 
-- Local recovery and version history
+- Verified disk autosave, local recovery, and immutable snapshots
 - Undo and Redo
 - Open, Save, Save As, and Download a copy fallbacks
 - Find and replace
@@ -38,16 +52,17 @@ requests.
 
 ## Browser support
 
-The release targets current Chrome, Edge, Firefox, and Safari on desktop,
-Safari on iOS/iPadOS, and Chrome on Android. Direct connected-file writes use
-the File System Access API where available; file input and downloads work as the
-cross-browser fallback.
+Durable editing requires a desktop Chromium browser that implements the File
+System Access API, such as current Chrome or Edge. Browsers without directory
+access remain read-only so they cannot silently make browser storage the only
+copy. Opening files and downloading copies remain available as transfer tools,
+but they do not replace the required verified workspace.
 
 ## Privacy
 
 Plaintext Web has no analytics, accounts, cloud sync, or runtime network
 dependencies. Browser recovery uses localStorage when available. Saving or
-downloading a file happens only when you ask.
+downloading uses only the workspace or file location you explicitly select.
 
 ## Credits
 
