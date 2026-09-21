@@ -900,6 +900,8 @@ async function connectWorkspace() {
       disk = JSON.parse(raw);
       if (!validateDocumentRevision(disk)) throw new Error("invalid Plaintext recovery metadata");
       if (await digestText(disk.text, crypto.subtle) !== disk.digest) throw new Error("Plaintext recovery integrity check failed");
+      const preserved = await workspace.snapshots.getFileHandle("reconnected-" + disk.savedAt + "-r" + disk.revision + ".json", { create: true });
+      await writeVerifiedFile(preserved, raw);
     }
     const cacheRaw = store.get(K.durable);
     let cache = null;
