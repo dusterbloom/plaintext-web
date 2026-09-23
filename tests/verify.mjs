@@ -74,6 +74,29 @@ function extractFunctionSource(html, name) {
   assert.fail(name + " function is not balanced");
 }
 
+test("cancelling the folder picker keeps the current workspace", async () => {
+  const source = "async " + extractFunctionSource(readApp(), "connectWorkspace");
+  const durableState = { kind: "connected" };
+  const editor = { disabled: false };
+  const alerts = [];
+  const connectWorkspace = new Function(
+    "window", "durableState", "editor", "isAbort", "showAlert", "renderPersistenceStatus",
+    source + "; return connectWorkspace;",
+  )(
+    { async showDirectoryPicker() { throw Object.assign(new Error("cancelled"), { name: "AbortError" }); } },
+    durableState,
+    editor,
+    (error) => error && error.name === "AbortError",
+    (message) => alerts.push(message),
+    () => {},
+  );
+
+  assert.equal(await connectWorkspace(), false);
+  assert.equal(durableState.kind, "connected");
+  assert.equal(editor.disabled, false);
+  assert.deepEqual(alerts, []);
+});
+
 function writingSessionHarness(saved, { progress, now }) {
   const html = readApp();
   const {

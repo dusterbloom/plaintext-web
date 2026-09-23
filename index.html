@@ -60,11 +60,10 @@ body{
   border:0;
 }
 
+/* Shown only when writing is blocked or at risk; silent while saves succeed. */
 .persistence-status{
-  flex:none; align-self:center; max-width:min(90vw,560px); margin:8px 16px 0;
-  padding:6px 10px; border-radius:7px; text-align:center;
-  color:var(--fg); background:color-mix(in srgb,var(--sec) 13%,transparent);
-  font-size:12px; line-height:1.4;
+  flex:none; align-self:center; max-width:min(90vw,560px); margin:6px 16px 0;
+  text-align:center; color:var(--sec); font-size:12px; line-height:1.4;
 }
 
 .wrap{flex:1; min-height:0; width:100%; max-width:760px; margin:0 auto; padding:0 28px}
@@ -286,7 +285,6 @@ select{
     Untitled
   </button>
   <div id="persistenceStatus" class="persistence-status" role="status" aria-live="polite" hidden></div>
-  <button class="btn" id="connectWorkspace" type="button">Connect workspace</button>
   <div class="wrap">
     <div class="stack">
       <div id="ghost" aria-hidden="true" hidden><span id="ghostText"></span><span id="ghostFill"></span></div>
@@ -854,8 +852,10 @@ doc.lastSnapshot = doc.history.length ? doc.history[0].text : doc.text;
 const persistence = {
   healthy: store.live(),
   historyPaused: !store.live(),
+  notice: "",
 };
-let durableState = { kind: "disconnected", workspace: null, revision: 0, digest: null, queue: Promise.resolve() };
+let durableState = { kind: "disconnected", notice: "", workspace: null, revision: 0, digest: null, queue: Promise.resolve() };
+let pendingDiskWrites = 0;
 
 async function writeDurableDocument(text, name) {
   if (durableState.kind !== "connected") throw new Error("workspace disconnected");
@@ -863,37 +863,51 @@ async function writeDurableDocument(text, name) {
   const revision = durableState.revision + 1;
   const record = makeDocumentRevision(text, name, Date.now(), revision, digest, durableState.digest);
   const metadata = JSON.stringify(record, null, 2) + "\n";
-  renderPersistenceStatus("Saving to disk…");
   const snapshot = await durableState.workspace.snapshots.getFileHandle(String(record.savedAt) + "-r" + revision + ".json", { create: true });
   await writeVerifiedFile(snapshot, metadata);
   await writeVerifiedFile(durableState.workspace.document, text);
   await writeVerifiedFile(durableState.workspace.latest, metadata);
   durableState.revision = revision;
   durableState.digest = digest;
-  renderPersistenceStatus("Saved to disk");
+  store.set(K.durable, JSON.stringify(record));
   return record;
 }
 
 function enqueueDurableDocument() {
   const text = doc.text;
   const name = doc.name;
-  durableState.queue = durableState.queue.then(() => writeDurableDocument(text, name));
+  // Flushes on blur, tab switches, and unload must not mint identical revisions.
+  if (text === durableState.queuedText && name === durableState.queuedName) return durableState.queue;
+  durableState.queuedText = text;
+  durableState.queuedName = name;
+  pendingDiskWrites += 1;
+  durableState.queue = durableState.queue
+    .then(() => writeDurableDocument(text, name))
+    .finally(() => { pendingDiskWrites -= 1; });
   durableState.queue.catch(() => {
     durableState.kind = "disconnected";
+    durableState.notice = "Disk backup disconnected. Choose Connect workspace from the title menu to keep writing.";
     editor.disabled = true;
-    renderPersistenceStatus("Backup disconnected—reconnect to edit.");
+    renderPersistenceStatus();
   });
   return durableState.queue;
 }
 
 async function connectWorkspace() {
   if (!window.showDirectoryPicker) {
-    renderPersistenceStatus("This browser cannot verify disk backups. Plaintext is read-only.");
+    showAlert("This browser cannot verify disk backups. Use desktop Chrome or Edge to write with Plaintext.");
+    return false;
+  }
+  let directory;
+  try {
+    directory = await window.showDirectoryPicker({ mode: "readwrite" });
+  } catch (error) {
+    // Cancelling leaves the current workspace, or the read-only lock, exactly as it was.
+    if (!isAbort(error)) showAlert("Could not open the folder picker. " + (error && error.message ? error.message : ""));
     return false;
   }
   try {
-    renderPersistenceStatus("Connecting…");
-    const workspace = await createPlaintextWorkspace(await window.showDirectoryPicker({ mode: "readwrite" }));
+    const workspace = await createPlaintextWorkspace(directory);
     let disk = null;
     const raw = await (await workspace.latest.getFile()).text();
     if (raw.trim()) {
@@ -913,17 +927,18 @@ async function connectWorkspace() {
       replaceEditorText(doc.text);
       renderTitle();
     }
-    durableState = { kind: "connected", workspace, revision: disk?.revision || 0,
-      digest: disk?.digest || null, queue: Promise.resolve() };
+    durableState = { kind: "connected", notice: "", workspace, revision: disk?.revision || 0,
+      digest: disk?.digest || null, queuedText: disk?.text, queuedName: disk?.name, queue: Promise.resolve() };
     editor.disabled = false;
+    renderPersistenceStatus();
     await enqueueDurableDocument();
-    $("connectWorkspace").textContent = "Workspace connected";
     editor.focus();
     return true;
   } catch (error) {
     durableState.kind = "disconnected";
+    durableState.notice = "Could not use that folder. Choose Connect workspace from the title menu to try again.";
     editor.disabled = true;
-    if (!isAbort(error)) renderPersistenceStatus("Backup disconnected—Plaintext is read-only.");
+    renderPersistenceStatus();
     return false;
   }
 }
@@ -971,24 +986,24 @@ function renderTitle() {
   document.title = doc.name === "Untitled" ? "Plaintext" : doc.name + " — Plaintext";
 }
 
-function renderPersistenceStatus(message) {
+// Workspace problems outrank local-recovery notices; a healthy workspace shows nothing.
+function renderPersistenceStatus() {
   const status = $("persistenceStatus");
-  status.textContent = message || "";
-  status.hidden = !message;
+  status.textContent = durableState.notice || persistence.notice;
+  status.hidden = !status.textContent;
 }
 
 function setPersistenceHealth(ok, trimmed) {
   persistence.healthy = ok;
   persistence.historyPaused = !ok;
   if (!ok) {
-    renderPersistenceStatus("Local recovery unavailable—save to a file.");
+    persistence.notice = "Local recovery unavailable—save to a file.";
   } else if (trimmed) {
-    renderPersistenceStatus(
-      "Current text recovered; older versions were removed to make space.",
-    );
+    persistence.notice = "Current text recovered; older versions were removed to make space.";
   } else {
-    renderPersistenceStatus("");
+    persistence.notice = "";
   }
+  renderPersistenceStatus();
 }
 
 function isDirty() {
@@ -1082,11 +1097,7 @@ function persistNow() {
     trimHistory();
     writeHistory();
   }
-  if (durableState.kind === "connected") {
-    void enqueueDurableDocument().then((record) => {
-      store.set(K.durable, JSON.stringify(record));
-    });
-  }
+  if (durableState.kind === "connected") void enqueueDurableDocument();
 }
 
 /* ---------- version history ---------- */
@@ -1469,6 +1480,8 @@ function openHistory() {
 
 /* ---------- command palette ---------- */
 const COMMANDS = [
+  { title: () => (durableState.kind === "connected" ? "Change workspace folder…" : "Connect workspace…"),
+    keys: "", run: connectWorkspace },
   { title: "New document",            keys: CMD + "N",            run: newDocument },
   { title: "Open document",           keys: CMD + "O",            run: openDocument },
   { title: "Save",                    keys: CMD + "S",            run: save },
@@ -1581,8 +1594,9 @@ function toggleFullscreen() {
  * Input wiring
  * ------------------------------------------------------------------ */
 editor.disabled = true;
-$("connectWorkspace").addEventListener("click", () => { void connectWorkspace(); });
-if (!window.showDirectoryPicker) renderPersistenceStatus("This browser cannot verify disk backups. Plaintext is read-only.");
+durableState.notice = window.showDirectoryPicker
+  ? "Choose Connect workspace from the title menu to start writing."
+  : "This browser cannot verify disk backups. Plaintext is read-only.";
 editor.addEventListener("input", () => setText(editor.value, { fromEditor: true }));
 
 editor.addEventListener("keydown", (e) => {
@@ -1678,7 +1692,8 @@ document.addEventListener("visibilitychange", () => {
 });
 window.addEventListener("beforeunload", (event) => {
   persistNow();
-  if (!persistence.healthy && isDirty()) {
+  // Saving is silent, so the browser's own leave prompt guards writes still in flight.
+  if ((!persistence.healthy && isDirty()) || pendingDiskWrites > 0) {
     event.preventDefault();
     event.returnValue = "";
   }

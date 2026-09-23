@@ -9,19 +9,23 @@ a recovery cache.
 
 ## Durable workspace
 
-Plaintext is read-only until **Connect workspace** succeeds. Choose a folder
-you control; Plaintext creates `Plaintext/document.md`, recovery metadata at
+Plaintext is read-only until a workspace is connected. Choose a folder you
+control; Plaintext creates `Plaintext/document.md`, recovery metadata at
 `Plaintext/recovery/latest.json`, and immutable snapshots under
 `Plaintext/recovery/snapshots/`. Writes are serialized, closed, and read back
-before **Saved to disk** appears. Browser storage is only a recovery cache. A
-permission or verification failure locks editing until reconnection.
+before they count as saved. Saving is silent while it works; a status line
+appears under the title only when editing is locked or a write fails. Browser
+storage is only a recovery cache. A permission or verification failure locks
+editing until reconnection.
 
 On each launch:
 
-1. Select **Connect workspace**.
+1. Click the document title to open the menu and choose **Connect workspace…**.
 2. Choose the parent folder that should contain Plaintext's durable data.
 3. Resolve any disk/browser divergence when prompted.
-4. Do not close the page while the status says **Saving to disk…**.
+
+If you try to close the page while a write is still in progress, the browser
+asks you to stay.
 
 Plaintext preserves the existing disk revision before reconciliation and never
 automatically deletes snapshots. Copy the whole `Plaintext` directory to
