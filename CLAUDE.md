@@ -107,7 +107,7 @@ Status appears only when the writer has to act.
 - **Locking:** editing starts locked (`editor.disabled = true`). The only way
   in is the palette's first command ("Connect workspace…", or "Change
   workspace folder…" once connected), which runs `connectWorkspace()`.
-  Cancelling the folder picker changes nothing.
+  Cancelling the folder picker changes nothing. At launch `restoreWorkspace()` reuses the folder handle saved in IndexedDB: it reconnects silently if permission is still granted, otherwise the menu offers "Reconnect to …" (`reconnectWorkspace()` calls `requestPermission` before any await, so the menu click still counts as a user gesture).
 - **Status line:** `#persistenceStatus` renders
   `durableState.notice || persistence.notice` and stays hidden while saves
   succeed.
@@ -119,7 +119,6 @@ The durable-autosave spec (`docs/superpowers/specs/2026-09-21-durable-autosave-d
 is only partly implemented. Check the code before assuming spec behaviour. The
 current gaps:
 
-- The folder handle isn't persisted in IndexedDB.
 - Conflicts are resolved with `window.confirm`.
 - Every changed write creates a snapshot.
 - Only picker cancellation is tested; lock and conflict have no tests.

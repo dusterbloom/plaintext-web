@@ -97,6 +97,37 @@ test("cancelling the folder picker keeps the current workspace", async () => {
   assert.deepEqual(alerts, []);
 });
 
+test("remembered workspace reconnects silently only when permission is granted", async () => {
+  const source = "async " + extractFunctionSource(readApp(), "restoreWorkspace");
+  async function restore(handle) {
+    const connected = [];
+    const durableState = { notice: "" };
+    await new Function(
+      "window", "rememberedWorkspace", "connectWorkspace", "durableState", "renderPersistenceStatus",
+      "let rememberedDirectory = null; " + source + "; return restoreWorkspace;",
+    )(
+      { showDirectoryPicker() {} },
+      async () => handle,
+      async (directory) => { connected.push(directory); return true; },
+      durableState,
+      () => {},
+    )();
+    return { connected, notice: durableState.notice };
+  }
+  const folder = (permission) => ({ name: "Docs", async queryPermission() { return permission; } });
+
+  const granted = folder("granted");
+  assert.deepEqual(await restore(granted), { connected: [granted], notice: "" });
+  assert.deepEqual(await restore(folder("prompt")), {
+    connected: [],
+    notice: "Choose Reconnect to \u201cDocs\u201d from the title menu to keep writing.",
+  });
+  assert.deepEqual(await restore(undefined), {
+    connected: [],
+    notice: "Choose Connect workspace from the title menu to start writing.",
+  });
+});
+
 function writingSessionHarness(saved, { progress, now }) {
   const html = readApp();
   const {

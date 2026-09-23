@@ -20,7 +20,7 @@ editing until reconnection.
 
 On each launch:
 
-1. Click the document title to open the menu and choose **Connect workspace…**.
+1. Click the document title to open the menu and choose **Connect workspace…**. After the first time, Plaintext reconnects to the same folder on launch; if the browser asks again, choose **Reconnect** from the menu.
 2. Choose the parent folder that should contain Plaintext's durable data.
 3. Resolve any disk/browser divergence when prompted.
 

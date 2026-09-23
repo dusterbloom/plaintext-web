@@ -893,18 +893,61 @@ function enqueueDurableDocument() {
   return durableState.queue;
 }
 
-async function connectWorkspace() {
+let rememberedDirectory = null;
+
+// Handles can't live in localStorage; IndexedDB keeps the folder between launches.
+function workspaceStore(mode, action) {
+  return new Promise((resolve, reject) => {
+    const open = indexedDB.open("plaintext", 1);
+    open.onupgradeneeded = () => open.result.createObjectStore("handles");
+    open.onerror = () => reject(open.error);
+    open.onsuccess = () => {
+      const db = open.result;
+      const tx = db.transaction("handles", mode);
+      const request = action(tx.objectStore("handles"));
+      tx.oncomplete = () => { db.close(); resolve(request.result); };
+      tx.onerror = tx.onabort = () => { db.close(); reject(tx.error); };
+    };
+  });
+}
+const rememberWorkspace = (directory) => workspaceStore("readwrite", (store) => store.put(directory, "workspace"));
+const rememberedWorkspace = () => workspaceStore("readonly", (store) => store.get("workspace"));
+
+async function restoreWorkspace() {
+  if (!window.showDirectoryPicker) return;
+  try {
+    rememberedDirectory = (await rememberedWorkspace()) || null;
+    if (rememberedDirectory && await rememberedDirectory.queryPermission({ mode: "readwrite" }) === "granted") {
+      await connectWorkspace(rememberedDirectory);
+      return;
+    }
+  } catch (_) { /* no remembered folder; fall through to the manual choice */ }
+  durableState.notice = rememberedDirectory
+    ? "Choose Reconnect to “" + rememberedDirectory.name + "” from the title menu to keep writing."
+    : "Choose Connect workspace from the title menu to start writing.";
+  renderPersistenceStatus();
+}
+
+async function reconnectWorkspace() {
+  // requestPermission needs the menu's user activation, so it runs before any await.
+  const directory = rememberedDirectory;
+  if (await directory.requestPermission({ mode: "readwrite" }) !== "granted") return false;
+  return connectWorkspace(directory);
+}
+
+async function connectWorkspace(directory = null) {
   if (!window.showDirectoryPicker) {
     showAlert("This browser cannot verify disk backups. Use desktop Chrome or Edge to write with Plaintext.");
     return false;
   }
-  let directory;
-  try {
-    directory = await window.showDirectoryPicker({ mode: "readwrite" });
-  } catch (error) {
-    // Cancelling leaves the current workspace, or the read-only lock, exactly as it was.
-    if (!isAbort(error)) showAlert("Could not open the folder picker. " + (error && error.message ? error.message : ""));
-    return false;
+  if (directory === null) {
+    try {
+      directory = await window.showDirectoryPicker({ mode: "readwrite" });
+    } catch (error) {
+      // Cancelling leaves the current workspace, or the read-only lock, exactly as it was.
+      if (!isAbort(error)) showAlert("Could not open the folder picker. " + (error && error.message ? error.message : ""));
+      return false;
+    }
   }
   try {
     const workspace = await createPlaintextWorkspace(directory);
@@ -932,6 +975,8 @@ async function connectWorkspace() {
     editor.disabled = false;
     renderPersistenceStatus();
     await enqueueDurableDocument();
+    rememberWorkspace(directory).catch(() => {});
+    rememberedDirectory = directory;
     editor.focus();
     return true;
   } catch (error) {
@@ -939,6 +984,7 @@ async function connectWorkspace() {
     durableState.notice = "Could not use that folder. Choose Connect workspace from the title menu to try again.";
     editor.disabled = true;
     renderPersistenceStatus();
+    if (directory === rememberedDirectory) rememberedDirectory = null;
     return false;
   }
 }
@@ -1480,8 +1526,9 @@ function openHistory() {
 
 /* ---------- command palette ---------- */
 const COMMANDS = [
-  { title: () => (durableState.kind === "connected" ? "Change workspace folder…" : "Connect workspace…"),
-    keys: "", run: connectWorkspace },
+  { title: () => (durableState.kind === "connected" ? "Change workspace folder…"
+      : rememberedDirectory ? "Reconnect to “" + rememberedDirectory.name + "”" : "Connect workspace…"),
+    keys: "", run: () => (durableState.kind !== "connected" && rememberedDirectory ? reconnectWorkspace() : connectWorkspace()) },
   { title: "New document",            keys: CMD + "N",            run: newDocument },
   { title: "Open document",           keys: CMD + "O",            run: openDocument },
   { title: "Save",                    keys: CMD + "S",            run: save },
@@ -1594,9 +1641,7 @@ function toggleFullscreen() {
  * Input wiring
  * ------------------------------------------------------------------ */
 editor.disabled = true;
-durableState.notice = window.showDirectoryPicker
-  ? "Choose Connect workspace from the title menu to start writing."
-  : "This browser cannot verify disk backups. Plaintext is read-only.";
+durableState.notice = window.showDirectoryPicker ? "" : "This browser cannot verify disk backups. Plaintext is read-only.";
 editor.addEventListener("input", () => setText(editor.value, { fromEditor: true }));
 
 editor.addEventListener("keydown", (e) => {
@@ -2023,6 +2068,7 @@ restoreSession();
 renderCount();
 editor.setSelectionRange(doc.text.length, doc.text.length);
 if (!matchMedia("(pointer:coarse)").matches) editor.focus();
+void restoreWorkspace();
 
 })();
 </script>
