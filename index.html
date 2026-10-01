@@ -467,19 +467,6 @@ function documentIsDirty(text, cleanText) {
   return text !== cleanText;
 }
 
-async function digestText(text, subtle) {
-  const bytes = await subtle.digest("SHA-256", new TextEncoder().encode(text));
-  return Array.from(new Uint8Array(bytes), (byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
-function makeDocumentRevision(text, name, savedAt, revision, digest, parentDigest = null) {
-  if (typeof text !== "string" || typeof name !== "string" || !Number.isSafeInteger(savedAt)
-    || !Number.isSafeInteger(revision) || revision < 1 || !/^[a-f0-9]{64}$/u.test(digest)) {
-    throw new TypeError("invalid document revision");
-  }
-  return { format: "plaintext-web", version: 1, name, savedAt, revision, parentDigest, digest, text };
-}
-
 function validateDocumentRevision(value) {
   const fields = ["format", "version", "name", "savedAt", "revision", "parentDigest", "digest", "text"];
   return Boolean(value && typeof value === "object" && !Array.isArray(value)
@@ -492,15 +479,6 @@ function validateDocumentRevision(value) {
     && /^[a-f0-9]{64}$/u.test(value.digest));
 }
 
-function compareDocumentRevisions(disk, cache) {
-  if (!disk) return cache ? "cache" : "same";
-  if (!cache) return "disk";
-  if (disk.digest === cache.digest) return "same";
-  if (cache.parentDigest === disk.digest && cache.revision > disk.revision) return "cache";
-  if (disk.parentDigest === cache.digest && disk.revision > cache.revision) return "disk";
-  return "conflict";
-}
-
 async function writeVerifiedFile(handle, text) {
   const writable = await handle.createWritable();
   await writable.write(text);
@@ -509,42 +487,62 @@ async function writeVerifiedFile(handle, text) {
   if (actual !== text) throw new Error("disk write verification failed");
 }
 
-async function createPlaintextWorkspace(directory) {
-  const root = await directory.getDirectoryHandle("Plaintext", { create: true });
-  const recovery = await root.getDirectoryHandle("recovery", { create: true });
-  const snapshots = await recovery.getDirectoryHandle("snapshots", { create: true });
-  return {
-    document: await root.getFileHandle("document.md", { create: true }),
-    latest: await recovery.getFileHandle("latest.json", { create: true }),
-    snapshots,
-  };
+const MINUTE_MS = 60_000;
+const HOUR_MS = 60 * MINUTE_MS;
+const DAY_MS = 24 * HOUR_MS;
+
+// Time Machine-style thinning by age: the newest version per 2 minutes for an hour,
+// per hour for a day, per day for a month, then per week. Pinned versions always stay.
+function keepVersions(versions, now) {
+  const newestPerBucket = new Map();
+  const kept = new Set();
+  for (const version of versions) {
+    if (version.pinned) {
+      kept.add(version.date);
+      continue;
+    }
+    const age = Math.max(0, now - version.date);
+    const size = age < HOUR_MS ? 2 * MINUTE_MS : age < DAY_MS ? HOUR_MS : age < 30 * DAY_MS ? DAY_MS : 7 * DAY_MS;
+    const bucket = size + ":" + Math.floor(age / size);
+    const newest = newestPerBucket.get(bucket);
+    if (newest === undefined || version.date > newest) newestPerBucket.set(bucket, version.date);
+  }
+  for (const date of newestPerBucket.values()) kept.add(date);
+  return kept;
 }
 
-function writeRecoveryWithFallback(
-  storage,
-  keys,
-  text,
-  history,
-  historyPaused = false,
-) {
-  if (storage.set(keys.recovery, text)) {
-    return { ok: true, history, trimmed: false };
+// Decides which text stays open when browser and document.md differ; the other one is
+// returned in `preserve` so it is saved as a pinned version. Nothing is ever discarded.
+function planDocumentSync(browser, disk, lastWrittenText) {
+  if (browser.text === disk.text) return { current: "browser", preserve: [] };
+  if (lastWrittenText !== null) {
+    const editedElsewhere = disk.text !== lastWrittenText && disk.text.trim() !== "";
+    return { current: "browser", preserve: editedElsewhere ? [disk.text] : [] };
   }
+  if (!disk.text.trim()) return { current: "browser", preserve: [] };
+  if (!browser.text.trim()) return { current: "disk", preserve: [] };
+  return disk.modified > browser.savedAt
+    ? { current: "disk", preserve: [browser.text] }
+    : { current: "browser", preserve: [disk.text] };
+}
 
-  if (historyPaused) {
-    return { ok: false, history, trimmed: false };
-  }
+function versionFileName(version) {
+  return new Date(version.date).toISOString().replace(/:/g, "-") + (version.pinned ? ".pinned.md" : ".md");
+}
 
-  const keepCount = Math.ceil(history.length / 2);
-  const shortened = history.slice(0, keepCount);
-  if (!storage.set(keys.history, JSON.stringify(shortened))) {
-    storage.del(keys.history);
-  }
+function versionFromFileName(name) {
+  const match = /^(\d{4}-\d\d-\d\dT\d\d)-(\d\d)-(\d\d\.\d{3}Z)(\.pinned)?\.md$/.exec(name);
+  if (!match) return null;
+  const date = Date.parse(match[1] + ":" + match[2] + ":" + match[3]);
+  return Number.isSafeInteger(date) ? { date, pinned: Boolean(match[4]) } : null;
+}
 
+async function openSafetyCopy(directory) {
+  const root = directory.name === "Plaintext" ? directory : await directory.getDirectoryHandle("Plaintext", { create: true });
   return {
-    ok: storage.set(keys.recovery, text),
-    history: shortened,
-    trimmed: true,
+    root,
+    document: await root.getFileHandle("document.md", { create: true }),
+    history: await root.getDirectoryHandle("history", { create: true }),
   };
 }
 
@@ -839,154 +837,278 @@ const doc = {
   name: store.get(K.name) || "Untitled",
   handle: null,
   history: [],
-  lastSnapshot: "",
+  savedAt: 0,
   undo: [],
   redo: [],
   lastCheckpoint: 0,
   saveTimer: 0
 };
 
-try { doc.history = JSON.parse(store.get(K.history) || "[]"); } catch (_) { doc.history = []; }
-doc.lastSnapshot = doc.history.length ? doc.history[0].text : doc.text;
+const persistence = { healthy: true, notice: "" };
+let pendingWrites = 0;
+let browserReady = false;
 
-const persistence = {
-  healthy: store.live(),
-  historyPaused: !store.live(),
-  notice: "",
-};
-let durableState = { kind: "disconnected", notice: "", workspace: null, revision: 0, digest: null, queue: Promise.resolve() };
-let pendingDiskWrites = 0;
+/* ---------- browser copy: IndexedDB, strict durability ---------- */
+const STRICT_WRITE = { durability: "strict" };
+let databasePromise = null;
 
-async function writeDurableDocument(text, name) {
-  if (durableState.kind !== "connected") throw new Error("workspace disconnected");
-  const digest = await digestText(text, crypto.subtle);
-  const revision = durableState.revision + 1;
-  const record = makeDocumentRevision(text, name, Date.now(), revision, digest, durableState.digest);
-  const metadata = JSON.stringify(record, null, 2) + "\n";
-  const snapshot = await durableState.workspace.snapshots.getFileHandle(String(record.savedAt) + "-r" + revision + ".json", { create: true });
-  await writeVerifiedFile(snapshot, metadata);
-  await writeVerifiedFile(durableState.workspace.document, text);
-  await writeVerifiedFile(durableState.workspace.latest, metadata);
-  durableState.revision = revision;
-  durableState.digest = digest;
-  store.set(K.durable, JSON.stringify(record));
-  return record;
-}
-
-function enqueueDurableDocument() {
-  const text = doc.text;
-  const name = doc.name;
-  // Flushes on blur, tab switches, and unload must not mint identical revisions.
-  if (text === durableState.queuedText && name === durableState.queuedName) return durableState.queue;
-  durableState.queuedText = text;
-  durableState.queuedName = name;
-  pendingDiskWrites += 1;
-  durableState.queue = durableState.queue
-    .then(() => writeDurableDocument(text, name))
-    .finally(() => { pendingDiskWrites -= 1; });
-  durableState.queue.catch(() => {
-    durableState.kind = "disconnected";
-    durableState.notice = "Disk backup disconnected. Choose Connect workspace from the title menu to keep writing.";
-    editor.disabled = true;
-    renderPersistenceStatus();
-  });
-  return durableState.queue;
-}
-
-let rememberedDirectory = null;
-
-// Handles can't live in localStorage; IndexedDB keeps the folder between launches.
-function workspaceStore(mode, action) {
-  return new Promise((resolve, reject) => {
-    const open = indexedDB.open("plaintext", 1);
-    open.onupgradeneeded = () => open.result.createObjectStore("handles");
-    open.onerror = () => reject(open.error);
-    open.onsuccess = () => {
+function openDatabase() {
+  databasePromise = databasePromise || new Promise((resolve, reject) => {
+    const open = indexedDB.open("plaintext", 2);
+    open.onupgradeneeded = () => {
       const db = open.result;
-      const tx = db.transaction("handles", mode);
-      const request = action(tx.objectStore("handles"));
-      tx.oncomplete = () => { db.close(); resolve(request.result); };
-      tx.onerror = tx.onabort = () => { db.close(); reject(tx.error); };
+      for (const name of ["handles", "state"]) {
+        if (!db.objectStoreNames.contains(name)) db.createObjectStore(name);
+      }
+      if (!db.objectStoreNames.contains("versions")) db.createObjectStore("versions", { keyPath: "date" });
     };
+    open.onsuccess = () => resolve(open.result);
+    open.onerror = () => reject(open.error);
+    open.onblocked = () => reject(new Error("database blocked"));
+  });
+  return databasePromise;
+}
+
+// Runs `action` on the named stores and resolves once the transaction has committed.
+async function withStores(names, mode, action) {
+  const db = await openDatabase();
+  const tx = db.transaction(names, mode, mode === "readwrite" ? STRICT_WRITE : undefined);
+  const request = action(...names.map((name) => tx.objectStore(name)));
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = () => resolve(request && request.result);
+    tx.onerror = tx.onabort = () => reject(tx.error);
   });
 }
-const rememberWorkspace = (directory) => workspaceStore("readwrite", (store) => store.put(directory, "workspace"));
-const rememberedWorkspace = () => workspaceStore("readonly", (store) => store.get("workspace"));
 
-async function restoreWorkspace() {
-  if (!window.showDirectoryPicker) return;
+async function migrateLocalStorage() {
+  let history = [];
+  try { history = JSON.parse(store.get(K.history) || "[]"); } catch (_) {}
+  const versions = (Array.isArray(history) ? history : [])
+    .filter((version) => version && Number.isSafeInteger(version.date) && typeof version.text === "string");
+  const current = { text: doc.text, name: doc.name, savedAt: Date.now() };
+  await withStores(["state", "versions"], "readwrite", (state, stored) => {
+    for (const version of versions) stored.put({ date: version.date, text: version.text, name: doc.name });
+    state.put(current, "current");
+  });
+  return current;
+}
+
+async function loadBrowserCopy() {
+  const current = (await withStores(["state"], "readonly", (state) => state.get("current")))
+    || await migrateLocalStorage();
+  doc.text = current.text;
+  doc.name = current.name;
+  doc.savedAt = current.savedAt;
+  doc.cleanText = store.get(K.clean) === fingerprint(doc.text) ? doc.text : null;
+  doc.history = (await withStores(["versions"], "readonly", (versions) => versions.getAll()))
+    .sort((a, b) => b.date - a.date);
+}
+
+function freeDate(date, taken) {
+  while (taken.has(date)) date += 1;
+  taken.add(date);
+  return date;
+}
+
+async function commitBrowserCopy(additions) {
+  const now = Date.now();
+  doc.savedAt = now;
+  const current = { text: doc.text, name: doc.name, savedAt: now };
+  const all = additions.concat(doc.history).sort((a, b) => b.date - a.date);
+  const kept = keepVersions(all, now);
+  doc.history = all.filter((version) => kept.has(version.date));
+  const dropped = all.filter((version) => !kept.has(version.date));
+  pendingWrites += 1;
   try {
-    rememberedDirectory = (await rememberedWorkspace()) || null;
-    if (rememberedDirectory && await rememberedDirectory.queryPermission({ mode: "readwrite" }) === "granted") {
-      await connectWorkspace(rememberedDirectory);
-      return;
-    }
-  } catch (_) { /* no remembered folder; fall through to the manual choice */ }
-  durableState.notice = rememberedDirectory
-    ? "Choose Reconnect to “" + rememberedDirectory.name + "” from the title menu to keep writing."
-    : "Choose Connect workspace from the title menu to start writing.";
-  renderPersistenceStatus();
-}
-
-async function reconnectWorkspace() {
-  // requestPermission needs the menu's user activation, so it runs before any await.
-  const directory = rememberedDirectory;
-  if (await directory.requestPermission({ mode: "readwrite" }) !== "granted") return false;
-  return connectWorkspace(directory);
-}
-
-async function connectWorkspace(directory = null) {
-  if (!window.showDirectoryPicker) {
-    showAlert("This browser cannot verify disk backups. Use desktop Chrome or Edge to write with Plaintext.");
-    return false;
+    await withStores(["state", "versions"], "readwrite", (state, versions) => {
+      state.put(current, "current");
+      for (const version of additions) if (kept.has(version.date)) versions.put(version);
+      for (const version of dropped) versions.delete(version.date);
+    });
+    if (!persistence.healthy) setPersistenceHealth(true);
+  } catch (_) {
+    setPersistenceHealth(false);
+  } finally {
+    pendingWrites -= 1;
   }
-  if (directory === null) {
+}
+
+// Saves the current text and a version of it. `pin` is a text that must never be
+// thinned away: what was on screen before a restore, New/Open, or a disk disagreement.
+function saveBrowserCopy(pin = null) {
+  const taken = new Set(doc.history.map((version) => version.date));
+  const now = Date.now();
+  const additions = [];
+  if (pin !== null && pin.trim()) additions.push({ date: freeDate(now, taken), text: pin, name: doc.name, pinned: true });
+  const newest = doc.history.find((version) => !version.pinned);
+  if (doc.text.trim() && (!newest || newest.text !== doc.text)) {
+    additions.push({ date: freeDate(now, taken), text: doc.text, name: doc.name });
+  }
+  return commitBrowserCopy(additions);
+}
+
+/* ---------- safety copy: a folder the writer picked once ---------- */
+// kind: "none" (no folder yet) | "paused" (needs a click to re-grant) | "on".
+const safetyCopy = { kind: "none", directory: null, notice: "", lastWritten: null, queue: Promise.resolve(true), regrantTried: false };
+
+const rememberDirectory = (directory) => withStores(["handles"], "readwrite", (handles) => handles.put(directory, "workspace"));
+const rememberedDirectoryHandle = () => withStores(["handles"], "readonly", (handles) => handles.get("workspace"));
+
+async function writeText(fileHandle, text) {
+  const writable = await fileHandle.createWritable();
+  await writable.write(text);
+  await writable.close();
+}
+
+// Revisions written by earlier versions of Plaintext, including the folders that the
+// old nesting bug created (Plaintext/Plaintext/...). Read once, never modified.
+async function legacyVersions(directory, depth = 0) {
+  const versions = [];
+  const files = [];
+  try {
+    const recovery = await directory.getDirectoryHandle("recovery");
+    try { files.push(await recovery.getFileHandle("latest.json")); } catch (_) {}
     try {
-      directory = await window.showDirectoryPicker({ mode: "readwrite" });
-    } catch (error) {
-      // Cancelling leaves the current workspace, or the read-only lock, exactly as it was.
-      if (!isAbort(error)) showAlert("Could not open the folder picker. " + (error && error.message ? error.message : ""));
-      return false;
+      for await (const handle of (await recovery.getDirectoryHandle("snapshots")).values()) {
+        if (handle.kind === "file" && handle.name.endsWith(".json")) files.push(handle);
+      }
+    } catch (_) {}
+  } catch (_) {}
+  for (const handle of files) {
+    try {
+      const record = JSON.parse(await (await handle.getFile()).text());
+      if (validateDocumentRevision(record) && record.text.trim()) {
+        versions.push({ date: record.savedAt, text: record.text, name: record.name });
+      }
+    } catch (_) {}
+  }
+  if (depth < 3) {
+    try { versions.push(...await legacyVersions(await directory.getDirectoryHandle("Plaintext"), depth + 1)); } catch (_) {}
+  }
+  return versions;
+}
+
+// Union of browser history and Plaintext/history on disk, thinned the same way on both sides.
+async function mergeHistory(copy, firstContact) {
+  const onDisk = new Map();
+  for await (const [fileName, handle] of copy.history.entries()) {
+    const parsed = handle.kind === "file" ? versionFromFileName(fileName) : null;
+    if (parsed) onDisk.set(parsed.date, { ...parsed, fileName, handle });
+  }
+  const known = new Set(doc.history.map((version) => version.date));
+  const incoming = [];
+  for (const [date, entry] of onDisk) {
+    if (!known.has(date)) incoming.push({ date, text: await (await entry.handle.getFile()).text(), name: doc.name, pinned: entry.pinned });
+  }
+  if (firstContact && !onDisk.size) {
+    const seen = new Set(known);
+    for (const version of await legacyVersions(copy.root)) {
+      if (!seen.has(version.date)) {
+        seen.add(version.date);
+        incoming.push(version);
+      }
     }
   }
-  try {
-    const workspace = await createPlaintextWorkspace(directory);
-    let disk = null;
-    const raw = await (await workspace.latest.getFile()).text();
-    if (raw.trim()) {
-      disk = JSON.parse(raw);
-      if (!validateDocumentRevision(disk)) throw new Error("invalid Plaintext recovery metadata");
-      if (await digestText(disk.text, crypto.subtle) !== disk.digest) throw new Error("Plaintext recovery integrity check failed");
-      const preserved = await workspace.snapshots.getFileHandle("reconnected-" + disk.savedAt + "-r" + disk.revision + ".json", { create: true });
-      await writeVerifiedFile(preserved, raw);
-    }
-    const cacheRaw = store.get(K.durable);
-    let cache = null;
-    try { cache = cacheRaw ? JSON.parse(cacheRaw) : null; } catch (_) {}
-    const choice = compareDocumentRevisions(disk, cache);
-    if (disk && (choice === "disk" || (choice === "conflict" && confirm("Disk and browser copies differ. OK restores disk; Cancel preserves browser text.")))) {
-      doc.text = disk.text;
-      doc.name = disk.name;
-      replaceEditorText(doc.text);
-      renderTitle();
-    }
-    durableState = { kind: "connected", notice: "", workspace, revision: disk?.revision || 0,
-      digest: disk?.digest || null, queuedText: disk?.text, queuedName: disk?.name, queue: Promise.resolve() };
-    editor.disabled = false;
+  if (incoming.length) await commitBrowserCopy(incoming);
+  const kept = new Set(doc.history.map((version) => version.date));
+  for (const version of doc.history) {
+    if (!onDisk.has(version.date)) await writeText(await copy.history.getFileHandle(versionFileName(version), { create: true }), version.text);
+  }
+  for (const [date, entry] of onDisk) {
+    if (!kept.has(date)) await copy.history.removeEntry(entry.fileName);
+  }
+}
+
+async function syncNow() {
+  const copy = await openSafetyCopy(safetyCopy.directory);
+  const firstContact = safetyCopy.lastWritten === null;
+  if (firstContact) await mergeHistory(copy, true);
+  const file = await copy.document.getFile();
+  const diskText = await file.text();
+  const plan = planDocumentSync({ text: doc.text, savedAt: doc.savedAt },
+    { text: diskText, modified: file.lastModified }, safetyCopy.lastWritten);
+  for (const text of plan.preserve) await saveBrowserCopy(text);
+  if (plan.current === "disk") {
+    setText(diskText, { force: true });
+    await saveBrowserCopy();
+  }
+  if (diskText !== doc.text) await writeText(copy.document, doc.text);
+  safetyCopy.lastWritten = doc.text;
+  await mergeHistory(copy, false);
+}
+
+// Resolves true when the safety copy is up to date; never rejects.
+function syncSafetyCopy() {
+  if (safetyCopy.kind !== "on") return Promise.resolve(false);
+  const run = () => (navigator.locks ? navigator.locks.request("plaintext-safety-copy", syncNow) : syncNow());
+  pendingWrites += 1;
+  const pending = safetyCopy.queue.then(run).then(() => true, () => {
+    safetyCopy.kind = "paused";
+    safetyCopy.notice = "Safety copy paused. Your text is safe in this browser; choose Resume safety copy from the title menu.";
     renderPersistenceStatus();
-    await enqueueDurableDocument();
-    rememberWorkspace(directory).catch(() => {});
-    rememberedDirectory = directory;
-    editor.focus();
-    return true;
-  } catch (error) {
-    durableState.kind = "disconnected";
-    durableState.notice = "Could not use that folder. Choose Connect workspace from the title menu to try again.";
-    editor.disabled = true;
-    renderPersistenceStatus();
-    if (directory === rememberedDirectory) rememberedDirectory = null;
+    return false;
+  }).finally(() => { pendingWrites -= 1; });
+  safetyCopy.queue = pending;
+  return pending;
+}
+
+function startSafetyCopy(directory) {
+  safetyCopy.kind = "on";
+  safetyCopy.directory = directory;
+  safetyCopy.lastWritten = null;
+  safetyCopy.notice = "";
+  renderPersistenceStatus();
+  return syncSafetyCopy();
+}
+
+async function chooseSafetyCopy() {
+  if (safetyCopy.kind === "paused" && safetyCopy.directory) {
+    // requestPermission needs the menu's user activation, so it runs before any other await.
+    if (await safetyCopy.directory.requestPermission({ mode: "readwrite" }) === "granted") {
+      return startSafetyCopy(safetyCopy.directory);
+    }
+  }
+  if (!window.showDirectoryPicker) {
+    showAlert("This browser can't keep a safety copy in a folder. Use Save As or Download a copy to keep a backup.");
     return false;
   }
+  let directory;
+  try {
+    directory = await window.showDirectoryPicker({ id: "plaintext", mode: "readwrite", startIn: "documents" });
+  } catch (error) {
+    // Cancelling leaves the current safety copy exactly as it was.
+    if (!isAbort(error)) showAlert("Could not open the folder picker. " + (error && error.message ? error.message : ""));
+    return false;
+  }
+  await rememberDirectory(directory).catch(() => {});
+  return startSafetyCopy(directory);
+}
+
+async function resumeSafetyCopy() {
+  let directory = null;
+  try { directory = (await rememberedDirectoryHandle()) || null; } catch (_) {}
+  if (directory) {
+    safetyCopy.directory = directory;
+    if (await directory.queryPermission({ mode: "readwrite" }) === "granted") return startSafetyCopy(directory);
+    safetyCopy.kind = "paused";
+  }
+  renderPersistenceStatus();
+  return false;
+}
+
+// requestPermission needs a user gesture, so the first click or key press re-grants the folder.
+function regrantSafetyCopy() {
+  if (safetyCopy.kind !== "paused" || !safetyCopy.directory || safetyCopy.regrantTried) return;
+  safetyCopy.regrantTried = true;
+  const directory = safetyCopy.directory;
+  directory.requestPermission({ mode: "readwrite" })
+    .then((permission) => { if (permission === "granted") void startSafetyCopy(directory); }, () => {});
+}
+
+function safetyCopyCommandTitle() {
+  if (safetyCopy.kind === "on") return "Safety copy: “" + safetyCopy.directory.name + "” (change folder…)";
+  if (safetyCopy.kind === "paused") return "Resume safety copy";
+  return doc.text.trim() ? "Choose safety-copy folder…" : "Restore from safety copy…";
 }
 
 /* ---------- rendering ---------- */
@@ -1032,23 +1154,20 @@ function renderTitle() {
   document.title = doc.name === "Untitled" ? "Plaintext" : doc.name + " — Plaintext";
 }
 
-// Workspace problems outrank local-recovery notices; a healthy workspace shows nothing.
+// Shows a line only when the writer has to act; a healthy safety copy shows nothing.
 function renderPersistenceStatus() {
   const status = $("persistenceStatus");
-  status.textContent = durableState.notice || persistence.notice;
+  const nudge = !browserReady ? ""
+    : safetyCopy.kind === "paused" ? "Safety copy paused. Click anywhere, or choose Resume safety copy from the title menu."
+    : safetyCopy.kind === "none" && window.showDirectoryPicker && doc.text.trim()
+      ? "Choose a safety-copy folder from the title menu so this text can never be lost." : "";
+  status.textContent = safetyCopy.notice || persistence.notice || nudge;
   status.hidden = !status.textContent;
 }
 
-function setPersistenceHealth(ok, trimmed) {
+function setPersistenceHealth(ok) {
   persistence.healthy = ok;
-  persistence.historyPaused = !ok;
-  if (!ok) {
-    persistence.notice = "Local recovery unavailable—save to a file.";
-  } else if (trimmed) {
-    persistence.notice = "Current text recovered; older versions were removed to make space.";
-  } else {
-    persistence.notice = "";
-  }
+  persistence.notice = ok ? "" : "Local recovery unavailable—save to a file.";
   renderPersistenceStatus();
 }
 
@@ -1121,53 +1240,15 @@ function schedulePersist() {
 
 function persistNow() {
   clearTimeout(doc.saveTimer);
-  const recovery = writeRecoveryWithFallback(
-    store,
-    K,
-    doc.text,
-    doc.history,
-    persistence.historyPaused,
-  );
-  doc.history = recovery.history;
-  setPersistenceHealth(recovery.ok, recovery.trimmed);
-
-  store.set(K.name, doc.name);
   if (doc.cleanText === null) {
     store.del(K.clean);
   } else {
     store.set(K.clean, fingerprint(doc.cleanText));
   }
-
-  if (!persistence.historyPaused && !recovery.trimmed) {
-    snapshotIfNeeded();
-    trimHistory();
-    writeHistory();
-  }
-  if (durableState.kind === "connected") void enqueueDurableDocument();
-}
-
-/* ---------- version history ---------- */
-function snapshotIfNeeded() {
-  if (doc.text === doc.lastSnapshot) return;
-  doc.history.unshift({ date: Date.now(), text: doc.text });
-  doc.lastSnapshot = doc.text;
-}
-
-function trimHistory() {
-  if (doc.history.length > 80) doc.history.length = 80;   // retain 80 versions
-  let bytes = 0;
-  for (let i = 0; i < doc.history.length; i++) {
-    bytes += doc.history[i].text.length;
-    if (bytes > 1_500_000) { doc.history.length = Math.max(1, i); break; }
-  }
-}
-
-function writeHistory() {
-  while (doc.history.length) {
-    if (store.set(K.history, JSON.stringify(doc.history))) return;
-    doc.history.length = Math.floor(doc.history.length / 2);   // quota exceeded
-  }
-  store.del(K.history);
+  renderPersistenceStatus();
+  // Until IndexedDB has loaded, the in-memory text is only a fallback and must not overwrite it.
+  if (!browserReady) return;
+  void saveBrowserCopy().then(() => syncSafetyCopy());
 }
 
 async function confirmDiscard() {
@@ -1214,15 +1295,13 @@ async function candidateFromFile(file, handle) {
 
 async function replaceDocument(candidate) {
   if (!(await confirmDiscard())) return false;
-  persistNow();
+  void saveBrowserCopy(doc.text);
   endSession();
   clearTimeout(doc.saveTimer);
   doc.name = candidate.name || "Untitled";
   doc.handle = candidate.handle || null;
   doc.text = candidate.text;
   doc.cleanText = candidate.clean ? candidate.text : null;
-  doc.history = [];
-  doc.lastSnapshot = candidate.text;
   doc.undo.length = 0;
   doc.redo.length = 0;
   doc.lastCheckpoint = 0;
@@ -1484,7 +1563,7 @@ $("countToggle").addEventListener("change", (e) => {
 /* ---------- version history dialog ---------- */
 async function restoreSnapshot(snapshot) {
   if (!(await confirmDiscard())) return false;
-  snapshotIfNeeded();
+  void saveBrowserCopy(doc.text);
   checkpoint(doc.text, true);
   doc.text = snapshot.text;
   replaceEditorText(snapshot.text);
@@ -1511,7 +1590,8 @@ function openHistory() {
       b.type = "button";
       b.innerHTML = "<span></span><span class='meta'>Restore</span>";
       b.firstElementChild.textContent = new Date(snapshot.date)
-        .toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+        .toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })
+        + (snapshot.name && snapshot.name !== doc.name ? " — " + snapshot.name : "");
       b.addEventListener("click", async () => {
         $("history").close();
         await restoreSnapshot(snapshot);
@@ -1526,9 +1606,7 @@ function openHistory() {
 
 /* ---------- command palette ---------- */
 const COMMANDS = [
-  { title: () => (durableState.kind === "connected" ? "Change workspace folder…"
-      : rememberedDirectory ? "Reconnect to “" + rememberedDirectory.name + "”" : "Connect workspace…"),
-    keys: "", run: () => (durableState.kind !== "connected" && rememberedDirectory ? reconnectWorkspace() : connectWorkspace()) },
+  { title: safetyCopyCommandTitle, keys: "", run: chooseSafetyCopy },
   { title: "New document",            keys: CMD + "N",            run: newDocument },
   { title: "Open document",           keys: CMD + "O",            run: openDocument },
   { title: "Save",                    keys: CMD + "S",            run: save },
@@ -1641,7 +1719,7 @@ function toggleFullscreen() {
  * Input wiring
  * ------------------------------------------------------------------ */
 editor.disabled = true;
-durableState.notice = window.showDirectoryPicker ? "" : "This browser cannot verify disk backups. Plaintext is read-only.";
+for (const type of ["pointerdown", "keydown"]) document.addEventListener(type, regrantSafetyCopy, true);
 editor.addEventListener("input", () => setText(editor.value, { fromEditor: true }));
 
 editor.addEventListener("keydown", (e) => {
@@ -1738,7 +1816,7 @@ document.addEventListener("visibilitychange", () => {
 window.addEventListener("beforeunload", (event) => {
   persistNow();
   // Saving is silent, so the browser's own leave prompt guards writes still in flight.
-  if ((!persistence.healthy && isDirty()) || pendingDiskWrites > 0) {
+  if ((!persistence.healthy && isDirty()) || pendingWrites > 0) {
     event.preventDefault();
     event.returnValue = "";
   }
@@ -2061,14 +2139,23 @@ window.addEventListener("resize", () => {
 /* ---------- start ---------- */
 applyTheme();
 buildSettings();
-editor.value = doc.text;
-renderTitle();
-setPersistenceHealth(persistence.healthy, false);
-restoreSession();
-renderCount();
-editor.setSelectionRange(doc.text.length, doc.text.length);
-if (!matchMedia("(pointer:coarse)").matches) editor.focus();
-void restoreWorkspace();
+void (async () => {
+  try {
+    await loadBrowserCopy();
+  } catch (_) {
+    setPersistenceHealth(false);   // keep the text recovered from localStorage in memory
+  }
+  browserReady = true;
+  editor.disabled = false;
+  editor.value = doc.text;
+  renderTitle();
+  restoreSession();
+  renderCount();
+  renderPersistenceStatus();
+  editor.setSelectionRange(doc.text.length, doc.text.length);
+  if (!matchMedia("(pointer:coarse)").matches) editor.focus();
+  await resumeSafetyCopy();
+})();
 
 })();
 </script>

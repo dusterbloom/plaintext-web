@@ -3,35 +3,28 @@
 Plaintext Web is an unofficial, dependency-free web adaptation inspired by
 JP Aumasson's [Plaintext](https://github.com/veorq/Plaintext).
 
-It is a quiet plain-text editor delivered as one self-contained HTML file. Its
-durable state lives in a folder you explicitly select; browser storage is only
-a recovery cache.
+It is a quiet plain-text editor delivered as one self-contained HTML file. It
+is always ready to type in, and it is built so you never lose a word.
 
-## Durable workspace
+## Never lose a word
 
-Plaintext is read-only until a workspace is connected. Choose a folder you
-control; Plaintext creates `Plaintext/document.md`, recovery metadata at
-`Plaintext/recovery/latest.json`, and immutable snapshots under
-`Plaintext/recovery/snapshots/`. Writes are serialized, closed, and read back
-before they count as saved. Saving is silent while it works; a status line
-appears under the title only when editing is locked or a write fails. Browser
-storage is only a recovery cache. A permission or verification failure locks
-editing until reconnection.
+Every pause in your typing is saved to the browser with strict durability, along
+with a version history thinned like Time Machine: the latest version every two
+minutes for an hour, then hourly for a day, daily for a month, and weekly after
+that. Before a restore, New, or Open, the text on screen is pinned so it is never
+thinned away.
 
-On each launch:
+Plaintext then nudges you once to choose a **safety-copy folder** (click the
+title). It keeps `Plaintext/document.md` and readable versions in
+`Plaintext/history/` there, remembers the folder, and re-grants access on your
+next click or key press if the browser asks again. If the browser and the folder
+ever disagree, the newer text stays open and the other becomes a pinned version;
+nothing is overwritten silently.
 
-1. Click the document title to open the menu and choose **Connect workspace…**. After the first time, Plaintext reconnects to the same folder on launch; if the browser asks again, choose **Reconnect** from the menu.
-2. Choose the parent folder that should contain Plaintext's durable data.
-3. Resolve any disk/browser divergence when prompted.
-
-If you try to close the page while a write is still in progress, the browser
-asks you to stay.
-
-Plaintext preserves the existing disk revision before reconciliation and never
-automatically deletes snapshots. Copy the whole `Plaintext` directory to
-restore or migrate a document. `document.md` is the current readable document;
-`recovery/latest.json` and `recovery/snapshots/` retain revision metadata and
-complete recovery states.
+If the browser's data is cleared, open Plaintext, click the title, and choose
+**Restore from safety copy…**. Older `recovery/` snapshots in that folder are
+merged into the history automatically. Put the folder somewhere that is itself
+backed up to survive a dead disk too.
 
 ## Try it
 
@@ -46,7 +39,7 @@ requests.
 
 ## Features
 
-- Verified disk autosave, local recovery, and immutable snapshots
+- Strict autosave, thinned version history, and a remembered safety-copy folder
 - Undo and Redo
 - Open, Save, Save As, and Download a copy fallbacks
 - Find and replace
@@ -56,17 +49,15 @@ requests.
 
 ## Browser support
 
-Durable editing requires a desktop Chromium browser that implements the File
-System Access API, such as current Chrome or Edge. Browsers without directory
-access remain read-only so they cannot silently make browser storage the only
-copy. Opening files and downloading copies remain available as transfer tools,
-but they do not replace the required verified workspace.
+The safety-copy folder needs a desktop Chromium browser with the File System
+Access API, such as current Chrome or Edge. Other browsers keep full editing with
+browser storage; use Save As or Download a copy for a backup.
 
 ## Privacy
 
 Plaintext Web has no analytics, accounts, cloud sync, or runtime network
-dependencies. Browser recovery uses localStorage when available. Saving or
-downloading uses only the workspace or file location you explicitly select.
+dependencies. Text and history are kept in the browser's IndexedDB. Saving or
+downloading uses only the folder or file location you explicitly select.
 
 ## Credits
 

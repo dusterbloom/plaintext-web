@@ -36,14 +36,48 @@ function extractTestableLogic(html, names) {
   )();
 }
 
-test("durable document revisions detect equality and divergence", async () => {
-  const api = extractTestableLogic(readApp(), ["digestText", "makeDocumentRevision", "validateDocumentRevision", "compareDocumentRevisions"]);
-  const digest = await api.digestText("hello", crypto.subtle);
-  const first = api.makeDocumentRevision("hello", "note.md", 10, 1, digest, null);
-  assert.equal(api.validateDocumentRevision(first), true);
-  assert.equal(api.compareDocumentRevisions(first, { ...first }), "same");
-  assert.equal(api.compareDocumentRevisions(first, { ...first, revision: 2, parentDigest: digest, digest: "next" }), "cache");
-  assert.equal(api.compareDocumentRevisions(first, { ...first, digest: "other" }), "conflict");
+test("history thinning keeps pinned versions and the latest version per time bucket", () => {
+  const { keepVersions } = extractTestableLogic(readApp(), ["keepVersions"]);
+  const MIN = 60_000, HOUR = 60 * MIN, DAY = 24 * HOUR;
+  const now = 400 * DAY;
+  const at = (age) => ({ date: now - age, text: "v" + age });
+  const versions = [
+    at(0), at(30_000),                    // same 2-minute bucket: keep newest only
+    at(10 * MIN),                         // its own 2-minute bucket
+    at(3 * HOUR), at(3 * HOUR + MIN),     // same hour: keep newest only
+    at(3 * DAY), at(3 * DAY + HOUR),      // same day: keep newest only
+    { ...at(3 * DAY + 2 * HOUR), pinned: true },
+    at(200 * DAY), at(200 * DAY + DAY),   // same week: keep newest only
+  ];
+  const kept = keepVersions(versions, now);
+  const keptAges = versions.filter((version) => kept.has(version.date)).map((version) => now - version.date);
+  assert.deepEqual(keptAges, [0, 10 * MIN, 3 * HOUR, 3 * DAY, 3 * DAY + 2 * HOUR, 200 * DAY]);
+  assert.equal(keepVersions([], now).size, 0);
+});
+
+test("document sync never discards either copy of a differing text", () => {
+  const { planDocumentSync } = extractTestableLogic(readApp(), ["planDocumentSync"]);
+  const browser = (text, savedAt = 10) => ({ text, savedAt });
+  const disk = (text, modified = 20) => ({ text, modified });
+  assert.deepEqual(planDocumentSync(browser("same"), disk("same"), null), { current: "browser", preserve: [] });
+  assert.deepEqual(planDocumentSync(browser("mine"), disk(""), null), { current: "browser", preserve: [] });
+  assert.deepEqual(planDocumentSync(browser(""), disk("restored"), null), { current: "disk", preserve: [] });
+  assert.deepEqual(planDocumentSync(browser("older", 10), disk("newer", 20), null), { current: "disk", preserve: ["older"] });
+  assert.deepEqual(planDocumentSync(browser("newer", 30), disk("older", 20), null), { current: "browser", preserve: ["older"] });
+  // While writing, the browser is current; an outside edit to document.md is kept as a version.
+  assert.deepEqual(planDocumentSync(browser("typing"), disk("last written"), "last written"), { current: "browser", preserve: [] });
+  assert.deepEqual(planDocumentSync(browser("typing"), disk("edited elsewhere"), "last written"),
+    { current: "browser", preserve: ["edited elsewhere"] });
+});
+
+test("history file names round-trip dates and pins", () => {
+  const { versionFileName, versionFromFileName } = extractTestableLogic(readApp(), ["versionFileName", "versionFromFileName"]);
+  const date = Date.UTC(2026, 9, 1, 16, 40, 5, 123);
+  assert.equal(versionFileName({ date }), "2026-10-01T16-40-05.123Z.md");
+  assert.equal(versionFileName({ date, pinned: true }), "2026-10-01T16-40-05.123Z.pinned.md");
+  assert.deepEqual(versionFromFileName("2026-10-01T16-40-05.123Z.md"), { date, pinned: false });
+  assert.deepEqual(versionFromFileName("2026-10-01T16-40-05.123Z.pinned.md"), { date, pinned: true });
+  assert.equal(versionFromFileName("notes.md"), null);
 });
 
 test("verified file writes close before read-back", async () => {
@@ -74,58 +108,51 @@ function extractFunctionSource(html, name) {
   assert.fail(name + " function is not balanced");
 }
 
-test("cancelling the folder picker keeps the current workspace", async () => {
-  const source = "async " + extractFunctionSource(readApp(), "connectWorkspace");
-  const durableState = { kind: "connected" };
-  const editor = { disabled: false };
+test("cancelling the folder picker keeps the current safety copy", async () => {
+  const source = "async " + extractFunctionSource(readApp(), "chooseSafetyCopy");
+  const safetyCopy = { kind: "on", directory: { name: "Docs" } };
   const alerts = [];
-  const connectWorkspace = new Function(
-    "window", "durableState", "editor", "isAbort", "showAlert", "renderPersistenceStatus",
-    source + "; return connectWorkspace;",
+  const started = [];
+  const chooseSafetyCopy = new Function(
+    "window", "safetyCopy", "isAbort", "showAlert", "rememberDirectory", "startSafetyCopy",
+    source + "; return chooseSafetyCopy;",
   )(
     { async showDirectoryPicker() { throw Object.assign(new Error("cancelled"), { name: "AbortError" }); } },
-    durableState,
-    editor,
+    safetyCopy,
     (error) => error && error.name === "AbortError",
     (message) => alerts.push(message),
-    () => {},
+    async () => {},
+    async (directory) => { started.push(directory); return true; },
   );
 
-  assert.equal(await connectWorkspace(), false);
-  assert.equal(durableState.kind, "connected");
-  assert.equal(editor.disabled, false);
+  assert.equal(await chooseSafetyCopy(), false);
+  assert.deepEqual(safetyCopy, { kind: "on", directory: { name: "Docs" } });
   assert.deepEqual(alerts, []);
+  assert.deepEqual(started, []);
 });
 
-test("remembered workspace reconnects silently only when permission is granted", async () => {
-  const source = "async " + extractFunctionSource(readApp(), "restoreWorkspace");
-  async function restore(handle) {
-    const connected = [];
-    const durableState = { notice: "" };
+test("remembered safety copy resumes silently only when permission is granted", async () => {
+  const source = "async " + extractFunctionSource(readApp(), "resumeSafetyCopy");
+  async function resume(handle) {
+    const started = [];
+    const safetyCopy = { kind: "none", directory: null };
     await new Function(
-      "window", "rememberedWorkspace", "connectWorkspace", "durableState", "renderPersistenceStatus",
-      "let rememberedDirectory = null; " + source + "; return restoreWorkspace;",
+      "rememberedDirectoryHandle", "startSafetyCopy", "safetyCopy", "renderPersistenceStatus",
+      source + "; return resumeSafetyCopy;",
     )(
-      { showDirectoryPicker() {} },
       async () => handle,
-      async (directory) => { connected.push(directory); return true; },
-      durableState,
+      async (directory) => { started.push(directory); return true; },
+      safetyCopy,
       () => {},
     )();
-    return { connected, notice: durableState.notice };
+    return { started, kind: safetyCopy.kind };
   }
   const folder = (permission) => ({ name: "Docs", async queryPermission() { return permission; } });
 
   const granted = folder("granted");
-  assert.deepEqual(await restore(granted), { connected: [granted], notice: "" });
-  assert.deepEqual(await restore(folder("prompt")), {
-    connected: [],
-    notice: "Choose Reconnect to \u201cDocs\u201d from the title menu to keep writing.",
-  });
-  assert.deepEqual(await restore(undefined), {
-    connected: [],
-    notice: "Choose Connect workspace from the title menu to start writing.",
-  });
+  assert.deepEqual(await resume(granted), { started: [granted], kind: "none" });
+  assert.deepEqual(await resume(folder("prompt")), { started: [], kind: "paused" });
+  assert.deepEqual(await resume(undefined), { started: [], kind: "none" });
 });
 
 function writingSessionHarness(saved, { progress, now }) {
@@ -323,98 +350,6 @@ test("destructive document changes have one safe guard", () => {
   assert.match(html, /id="discardConfirm"/);
   assert.match(html, /async function confirmDiscard\(/);
   assert.match(html, /async function replaceDocument\(/);
-});
-
-test("recovery write trims history once before giving up", () => {
-  const html = readApp();
-  const { writeRecoveryWithFallback } = extractTestableLogic(html, [
-    "writeRecoveryWithFallback",
-  ]);
-  const keys = { recovery: "r", history: "h" };
-
-  const healthy = new Map();
-  const healthyStore = {
-    set(key, value) {
-      healthy.set(key, value);
-      return true;
-    },
-    del(key) {
-      healthy.delete(key);
-    },
-  };
-  const first = writeRecoveryWithFallback(
-    healthyStore,
-    keys,
-    "current",
-    [1, 2, 3, 4],
-  );
-  assert.deepEqual(first, {
-    ok: true,
-    history: [1, 2, 3, 4],
-    trimmed: false,
-  });
-
-  let recoveryAttempts = 0;
-  const quotaStore = {
-    set(key) {
-      if (key === "r") {
-        recoveryAttempts += 1;
-        return recoveryAttempts > 1;
-      }
-      return true;
-    },
-    del() {},
-  };
-  const retried = writeRecoveryWithFallback(
-    quotaStore,
-    keys,
-    "current",
-    [1, 2, 3, 4],
-  );
-  assert.deepEqual(retried, { ok: true, history: [1, 2], trimmed: true });
-
-  const failedStore = { set: () => false, del() {} };
-  const failed = writeRecoveryWithFallback(
-    failedStore,
-    keys,
-    "current",
-    [1, 2, 3, 4],
-  );
-  assert.deepEqual(failed, { ok: false, history: [1, 2], trimmed: true });
-});
-
-test("paused recovery probes once without trimming history again", () => {
-  const html = readApp();
-  const { writeRecoveryWithFallback } = extractTestableLogic(html, [
-    "writeRecoveryWithFallback",
-  ]);
-  const history = [1, 2];
-  let recoveryWrites = 0;
-  let historyWrites = 0;
-  let historyDeletes = 0;
-  const store = {
-    set(key) {
-      if (key === "r") recoveryWrites += 1;
-      else historyWrites += 1;
-      return false;
-    },
-    del() {
-      historyDeletes += 1;
-    },
-  };
-
-  const result = writeRecoveryWithFallback(
-    store,
-    { recovery: "r", history: "h" },
-    "current",
-    history,
-    true,
-  );
-
-  assert.deepEqual(result, { ok: false, history, trimmed: false });
-  assert.equal(recoveryWrites, 1);
-  assert.equal(historyWrites, 0);
-  assert.equal(historyDeletes, 0);
 });
 
 test("file writer closes only after writing exact text", async () => {

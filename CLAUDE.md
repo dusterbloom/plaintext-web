@@ -63,65 +63,38 @@ Everything lives in one strict-mode IIFE, in this order:
 State is held in module-level objects:
 
 - `settings`
-- `doc`: text, `cleanText`, name, external file `handle`, local `history`, `undo`/`redo`
-- `persistence`: localStorage health
-- `durableState`: `kind`, workspace handles, `revision`, `digest`, and a serialized write `queue`
+- `doc`: text, `cleanText`, name, `savedAt`, external file `handle`, `history` (newest first), `undo`/`redo`
+- `persistence`: browser-storage health
+- `safetyCopy`: `kind`, folder handle, `lastWritten`, and a serialized sync `queue`
 - `session`: the writing goal
 
 **There are three persistence layers. Don't conflate them.**
 
-1. **Workspace on disk (source of truth, desktop Chromium only).**
-   - Uses the File System Access API. The user picks a parent folder, and
-     `createPlaintextWorkspace` creates:
-     - `Plaintext/document.md`
-     - `recovery/latest.json`: a revision record with `format`, `version`,
-       `name`, `savedAt`, `revision`, `parentDigest`, SHA-256 `digest`, and
-       `text`
-     - `recovery/snapshots/`
-   - Every write goes through `writeVerifiedFile`, which writes, closes, reads
-     the file back, and compares. `K.durable` is updated only after a
-     verified write.
-   - Writes are chained on `durableState.queue`, and are skipped when the
-     text and name match `queuedText`/`queuedName`. Any failure flips the
-     state to disconnected and disables the editor.
-   - On connect, `compareDocumentRevisions(disk, cache from K.durable)` picks
-     disk, browser, or conflict.
-2. **localStorage cache.**
-   - `K.recovery`: the current text.
-   - `K.history`: at most 80 versions and 1.5 MB.
-   - `K.clean`: a fingerprint of the last text saved to a file.
-   - `K.durable`: the last verified disk record.
-   - Settings and the session.
+1. **Browser copy (IndexedDB `plaintext`, v2, strict durability).**
+   - `state["current"]`: `{ text, name, savedAt }`.
+   - `versions` (keyPath `date`): `{ date, text, name, pinned? }`, thinned by
+     `keepVersions` (newest per 2 min for an hour, per hour for a day, per day
+     for 30 days, then per week). Pinned versions are never thinned.
+   - `handles["workspace"]`: the remembered safety-copy folder.
+   - `saveBrowserCopy(pin)` is the only writer; `persistNow()` calls it 1 s after
+     the last edit and on `pagehide`/`visibilitychange`/`beforeunload`, then
+     `syncSafetyCopy()`. Old localStorage text and history are migrated once.
+2. **Safety copy (File System Access, desktop Chromium only).**
+   - `Plaintext/document.md` and `Plaintext/history/<ISO date>[.pinned].md`.
+   - `syncNow()` uses `planDocumentSync`: the browser is current while writing;
+     on first contact the newer side wins; the other text always becomes a
+     pinned version. `mergeHistory` keeps browser and disk history a thinned
+     union, and imports old `recovery/` revisions (including nested
+     `Plaintext/Plaintext/…`) once.
+   - Editing is never locked. `safetyCopy.kind` is `none`, `paused` (the next
+     click or key press re-grants permission), or `on`.
 3. **Optional external file.** This is `doc.handle`, set by Open or Save As.
-   It is separate from the workspace, and Cmd+S writes to it.
-
-`persistNow()` is the single fan-out point. It writes localStorage recovery
-and history and, when a workspace is connected, queues a disk revision. It runs
-1 s after the last edit and again on `pagehide`, `visibilitychange`, and
-`beforeunload`.
+   It is separate from the safety copy, and Cmd+S writes to it.
 
 **Keep the writing surface free of chrome.** Distraction-free writing is the
 product. New controls go in the command palette (`COMMANDS`), not on the page.
-Status appears only when the writer has to act.
-
-- **Locking:** editing starts locked (`editor.disabled = true`). The only way
-  in is the palette's first command ("Connect workspace…", or "Change
-  workspace folder…" once connected), which runs `connectWorkspace()`.
-  Cancelling the folder picker changes nothing. At launch `restoreWorkspace()` reuses the folder handle saved in IndexedDB: it reconnects silently if permission is still granted, otherwise the menu offers "Reconnect to …" (`reconnectWorkspace()` calls `requestPermission` before any await, so the menu click still counts as a user gesture).
-- **Status line:** `#persistenceStatus` renders
-  `durableState.notice || persistence.notice` and stays hidden while saves
-  succeed.
-- **Close guard:** `beforeunload` prompts while `pendingDiskWrites > 0`.
-- **Known leak:** the lock covers the textarea only. Commands such as undo,
-  New/Open, Replace All, and history restore still change `doc` while locked.
-
-The durable-autosave spec (`docs/superpowers/specs/2026-09-21-durable-autosave-design.md`)
-is only partly implemented. Check the code before assuming spec behaviour. The
-current gaps:
-
-- Conflicts are resolved with `window.confirm`.
-- Every changed write creates a snapshot.
-- Only picker cancellation is tested; lock and conflict have no tests.
+`#persistenceStatus` appears only when the writer has to act (choose or resume
+the safety copy, or browser storage failed).
 
 Other wiring:
 
@@ -141,8 +114,8 @@ The tests read `index.html` as text and use three techniques:
 1. **`extractTestableLogic(html, names)`** evaluates the `@testable` block with
    `new Function` and returns the named functions. Code in that block must be
    pure: no `$`, DOM, `doc`, `store`, or `window`. Inject dependencies as
-   parameters, as `createSoundPlayer(now, createContext, getMode, tapBytes)`,
-   `writeRecoveryWithFallback(storage, keys, …)`, and `digestText(text, subtle)` do.
+   parameters, as `createSoundPlayer(now, createContext, getMode, tapBytes)` and
+   `planDocumentSync(browser, disk, lastWrittenText)` do.
 2. **`extractFunctionSource(html, name)`** slices a top-level `function name(`
    by counting braces and runs it against a fake context (see
    `writingSessionHarness`). A brace inside a string or regex in that function
@@ -155,9 +128,10 @@ The tests read `index.html` as text and use three techniques:
 For new logic, prefer a pure `@testable` function with injected dependencies
 and a behavioural test over another regex on the source.
 
-To try the workspace flow in a browser without a native folder picker, stub it
-in DevTools: `window.showDirectoryPicker = async () => navigator.storage.getDirectory()`.
-This uses the browser's private OPFS directory as the folder.
+`node tests/browser-smoke.mjs` runs `tests/browser-harness.html` in headless
+Chromium against a real OPFS folder: migration, connect, outside edits, reload,
+and restoring a wiped browser. To try the flow by hand, stub the picker in
+DevTools: `window.showDirectoryPicker = async () => navigator.storage.getDirectory()`.
 
 ## Conventions
 
@@ -168,7 +142,5 @@ This uses the browser's private OPFS directory as the folder.
     named `YYYY-MM-DD-<topic>[-design].md`.
   - Per-task reports go in `.superpowers/`.
   - Both directories are gitignored and exist only locally.
-- Durable editing requires `window.showDirectoryPicker`, so other browsers are
-  read-only by design (README). This conflicts with the v2 design
-  (`docs/superpowers/specs/2026-09-01-plaintext-web-v2-design.md`), which
-  requires editing on Firefox, Safari, iOS, and Android.
+- Editing works in every browser; only the safety-copy folder needs
+  `window.showDirectoryPicker` (desktop Chromium).
